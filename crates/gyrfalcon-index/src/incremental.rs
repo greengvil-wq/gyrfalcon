@@ -358,6 +358,7 @@ pub fn update(db: &Path, src: &Path, files: &[std::path::PathBuf]) -> Result<Inc
         }
     }
     tx.commit()?;
+    crate::navigation::refresh(&conn, src, files).map_err(IndexError::Unsupported)?;
 
     report.modules = разобранные.len();
     // Индекс перестал соответствовать своему `built_at`: часть его собрана

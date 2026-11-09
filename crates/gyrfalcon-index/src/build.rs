@@ -210,6 +210,7 @@ pub fn build(src: &Path, out: &Path, dict: Option<&Path>) -> Result<BuildReport>
     write_usages(&mut conn, &parsed, &mut report)?;
     conn.execute_batch(ddl::SCHEMA_FORMS)?;
     write_forms(&mut conn, src, &корни, &mut report)?;
+    crate::navigation::build(&conn, src).map_err(IndexError::Unsupported)?;
     // Ссылки строятся ПОСЛЕ всех таблиц-источников: они читают их, а не файлы.
     // Перехваты расширений: читают уже записанные модули и методы основной
     // конфигурации, поэтому идут ПОСЛЕ них — резолвинг цели это SQL по

@@ -321,13 +321,14 @@ fn schema_object() -> Value {
     обяз(
         json!({
             "name": {"type": "string", "description": "Имя объекта, например ЗаказКлиента"},
+            "field": {"type":"string", "description":"Реквизит или путь ТабличнаяЧасть.Колонка; карточка адресных использований поля"},
             "category": {"type": "string", "description":
                 "Категория (Catalogs/Documents/…), если имя неоднозначно"},
             "limit": {"type":"integer", "default":100, "minimum":1, "maximum":2000},
             "offset": {"type":"integer", "default":0, "minimum":0, "description":"Начало страницы каждого раздела связей"},
             "parts": {"type": "array", "items": {"type": "string"}, "description":
                 "Что включить: attributes, synonyms, predefined, enum_values, movements, based_on, basis_for, forms, rights, options, subscriptions, scheduled_jobs. \
-                 Также modules, metadata_in, metadata_out, code_usages, form_details, form_references, subsystems, defined_types, characteristic_types. По умолчанию — все разделы; новые разделы постраничные"}
+                 Также modules, metadata_in, metadata_out, code_usages, form_details, form_references, subsystems, defined_types, characteristic_types, query_usages, field_usages, rights_explicit, subscription_sources, subscription_handler. По умолчанию — все разделы; новые разделы постраничные"}
         }),
         &["name"],
     )
@@ -1004,14 +1005,18 @@ fn find(conn: &Connection, args: &Value) -> Result<Value, String> {
 /// кодом, а XML описания у них в выгрузке нет. Сверено на `ut-index`:
 /// реквизиты и движения ссылаются только на объекты из этого реестра.
 fn реестр_объектов(conn: &Connection) -> Result<Vec<(String, String)>, String> {
-    let mut st = conn
-        .prepare(
-            "SELECT object_name, category FROM object_synonyms
-             UNION
-             SELECT object_name, COALESCE(category, '') FROM modules
-             WHERE object_name IS NOT NULL AND COALESCE(category, '') <> 'Ext'",
-        )
-        .map_err(|e| e.to_string())?;
+    let mut query="SELECT object_name,category FROM object_synonyms UNION SELECT object_name,COALESCE(category,'') FROM modules WHERE object_name IS NOT NULL AND COALESCE(category,'')<>'Ext'".to_string();
+    for (table, name, category) in [
+        ("event_subscriptions", "name", "EventSubscriptions"),
+        ("scheduled_jobs", "name", "ScheduledJobs"),
+        ("role_rights", "role_name", "Roles"),
+        ("navigation_rights", "role", "Roles"),
+    ] {
+        if есть_таблица(conn, table) {
+            query.push_str(&format!(" UNION SELECT {name},'{category}' FROM {table}"));
+        }
+    }
+    let mut st = conn.prepare(&query).map_err(|e| e.to_string())?;
     let строки = st
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
         .map_err(|e| e.to_string())?
@@ -1289,6 +1294,36 @@ fn опции_объекта(
 /// без суффикса (`Document.X`), поэтому и сверка — без него. В столбце `via`
 /// — через какой определяемый тип подписка достала объект; пусто — объект
 /// назван источником напрямую.
+fn subscription_matches(
+    source: &str,
+    target: &str,
+    defs: &std::collections::HashMap<String, Vec<String>>,
+    seen: &mut std::collections::HashSet<String>,
+) -> bool {
+    if source == target {
+        return true;
+    }
+    if !seen.insert(source.to_string()) {
+        return false;
+    }
+    if let Some(types) = defs.get(source) {
+        return types
+            .iter()
+            .any(|t| subscription_matches(t, target, defs, seen));
+    }
+    let (typ, name) = source.split_once('.').unwrap_or((source, ""));
+    let normalized = typ
+        .strip_suffix("ValueManager")
+        .or_else(|| typ.strip_suffix("RecordSet"))
+        .or_else(|| typ.strip_suffix("Object"))
+        .or_else(|| typ.strip_suffix("Ref"))
+        .or_else(|| typ.strip_suffix("Manager"))
+        .unwrap_or(typ);
+    target
+        .split_once('.')
+        .is_some_and(|(kind, object)| kind == normalized && (name.is_empty() || name == object))
+}
+
 fn подписки_объекта(
     conn: &Connection,
     имя: &str,
@@ -1316,29 +1351,27 @@ fn подписки_объекта(
     // Определяемые типы, в составе которых есть объект (`Document.X`).
     let полные: Vec<String> = виды.iter().map(|вид| format!("{вид}.{имя}")).collect();
     let mut st = conn
-        .prepare(
-            "SELECT name, type_refs_json FROM defined_types WHERE instr(type_refs_json, ?1) > 0",
-        )
+        .prepare("SELECT name,type_refs_json FROM defined_types")
         .map_err(|e| e.to_string())?;
-    // Определяемый тип → какие из полных имён (у тёзок их несколько) в его составе.
-    let mut через: std::collections::HashMap<String, Vec<String>> = Default::default();
-    for запись in st
-        .query_map([имя], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+    let defs: std::collections::HashMap<String, Vec<String>> = st
+        .query_map([], |r| {
+            Ok((
+                format!("DefinedType.{}", r.get::<_, String>(0)?),
+                serde_json::from_str::<Vec<String>>(&r.get::<_, String>(1)?).unwrap_or_default(),
+            ))
         })
         .map_err(|e| e.to_string())?
-    {
-        let (тип, состав) = запись.map_err(|e| e.to_string())?;
-        let состав: Vec<String> = состав
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        let свои: Vec<String> = полные
+        .collect::<rusqlite::Result<_>>()
+        .map_err(|e| e.to_string())?;
+    let mut через: std::collections::HashMap<String, Vec<String>> = Default::default();
+    for name in defs.keys() {
+        let targets: Vec<String> = полные
             .iter()
-            .filter(|п| состав.contains(п))
+            .filter(|target| subscription_matches(name, target, &defs, &mut Default::default()))
             .cloned()
             .collect();
-        if !свои.is_empty() {
-            через.insert(format!("DefinedType.{тип}"), свои);
+        if !targets.is_empty() {
+            через.insert(name.clone(), targets);
         }
     }
     // Тёзки разных видов (справочник и документ): строка обязана сказать,
@@ -1489,7 +1522,7 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
     категории.sort();
     категории.dedup();
 
-    let parts: Vec<String> = args
+    let mut parts: Vec<String> = args
         .get("parts")
         .and_then(Value::as_array)
         .map(|a| {
@@ -1511,6 +1544,9 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
                 "options",
                 "subscriptions",
                 "scheduled_jobs",
+                "query_usages",
+                "field_usages",
+                "rights_explicit",
                 "forms",
                 "modules",
                 "metadata_in",
@@ -1526,6 +1562,21 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
             .map(|s| s.to_string())
             .collect()
         });
+    if строка(args, "field").is_some() && args.get("parts").is_none() {
+        parts = ["field_usages", "query_usages", "rights_explicit"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+    }
+    if категории.contains(&"EventSubscriptions") && args.get("parts").is_none() {
+        parts.extend([
+            "subscription_sources".to_string(),
+            "subscription_handler".to_string(),
+        ]);
+    }
+    if категории.contains(&"Roles") && args.get("parts").is_none() {
+        parts.push("role_objects".into());
+    }
     let есть = |p: &str| parts.iter().any(|x| x == p);
 
     // Категория из реестра (в его написании), только если её задали.
@@ -1768,6 +1819,51 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
             out[part] = object_relation(conn, part, &name, кат.as_deref(), &полные, limit, offset)?;
         }
     }
+    for part in ["query_usages", "field_usages", "rights_explicit"] {
+        if есть(part) {
+            out[part] = navigation_data(
+                conn,
+                part,
+                &полные,
+                строка(args, "field").as_deref(),
+                limit,
+                offset,
+            )?;
+        }
+    }
+    if есть("role_objects") {
+        out["role_objects"] = if есть_таблица(conn, "navigation_rights") {
+            let mut table=выборка(conn,"SELECT object_ref,right_name,allowed,file,line FROM navigation_rights WHERE role=?1 ORDER BY object_ref,right_name,id LIMIT ?2 OFFSET ?3",&[&name,&((limit+1) as i64),&(offset as i64)])?;
+            page_result(&mut table, limit, offset);
+            table
+        } else {
+            нет_таблицы("navigation_rights")
+        };
+    }
+    if есть("subscription_sources") {
+        out["subscription_sources"] = subscription_sources(conn, &name, limit, offset)?;
+    }
+    if есть("subscription_handler") {
+        let mut table=выборка(conn,"SELECT name,event,handler_module,handler_procedure,file,NULL AS via FROM event_subscriptions WHERE name=?1",&[&name])?;
+        add_subscription_handlers(conn, &mut table)?;
+        out["subscription_handler"] = table;
+    }
+    if let Some(field) = строка(args, "field") {
+        out["field"] = json!(field);
+    }
+    if есть("subscriptions") {
+        add_subscription_handlers(conn, &mut out["subscriptions"])?;
+        let rows = out["subscriptions"]["rows"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        out["subscriptions"]["rows"] = json!(rows
+            .into_iter()
+            .skip(offset)
+            .take(limit + 1)
+            .collect::<Vec<_>>());
+        page_result(&mut out["subscriptions"], limit, offset);
+    }
     out["coverage_note"] = json!("Связи из статического индекса; отсутствие строк не гарантирует отсутствие динамических обращений. Для старого индекса недоступные таблицы отмечены явно.");
     // Пустой раздел существующего объекта — факт о конфигурации, и он
     // назван, чтобы не путаться с «объекта нет» (тот ответ — выше, без карточки).
@@ -1780,6 +1876,146 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
         out["empty_parts"] = json!(пустые);
     }
     Ok(out)
+}
+
+/// Адресные связи из дополнительного индекса, без подстановки текстовых совпадений.
+fn navigation_data(
+    conn: &Connection,
+    part: &str,
+    full: &[String],
+    field: Option<&str>,
+    limit: usize,
+    offset: usize,
+) -> Result<Value, String> {
+    let table = if part == "rights_explicit" {
+        "navigation_rights"
+    } else {
+        "navigation_usages"
+    };
+    if !есть_таблица(conn, table) {
+        return Ok(нет_таблицы(table));
+    }
+    let state: Option<String> = conn
+        .query_row(
+            "SELECT value FROM index_meta WHERE key='navigation_state'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    if state.as_deref() != Some("ready") {
+        return Ok(
+            json!({"available":false,"note":"адресные связи неактуальны: нужна пересборка индекса"}),
+        );
+    }
+    let keys = json!(full.iter().map(|s| s.to_lowercase()).collect::<Vec<_>>()).to_string();
+    let filter = field.map(str::to_lowercase);
+    let field_refs: Vec<String> = full
+        .iter()
+        .map(|s| {
+            match field.and_then(|f| f.split_once('.')) {
+                Some((tab, col)) => format!("{s}.TabularSection.{tab}.Attribute.{col}"),
+                None => format!("{s}.Attribute.{}", field.unwrap_or("")),
+            }
+            .to_lowercase()
+        })
+        .collect();
+    let refs = json!(field_refs).to_string();
+    let query = if part == "rights_explicit" {
+        "SELECT r.role AS role_name,r.object_ref AS element,r.right_name,r.allowed,r.file,r.line FROM navigation_rights r WHERE EXISTS (SELECT 1 FROM json_each(?1) k WHERE (r.object_key=k.value OR (?2 IS NULL AND substr(r.object_key,1,length(k.value)+1)=k.value||'.'))) OR (?2 IS NOT NULL AND r.object_key IN (SELECT value FROM json_each(?3))) ORDER BY r.file,r.line,r.id".to_string()
+    } else {
+        let condition = if part == "query_usages" {
+            "u.kind IN ('bsl_query','xml_query','bsl_query_reference','xml_query_reference','xml_table_source')"
+        } else {
+            "u.field<>''"
+        };
+        format!("SELECT u.object_ref,u.field,u.kind,u.file,u.line,u.evidence,mo.rel_path AS method_module,m.name AS method_name,m.line AS method_line FROM navigation_usages u LEFT JOIN modules mo ON mo.rel_path=u.file LEFT JOIN methods m ON m.module_id=mo.id AND u.line BETWEEN m.line AND m.end_line WHERE u.object_key IN (SELECT value FROM json_each(?1)) AND {condition} AND (?2 IS NULL OR u.field_key=?2 OR substr(u.field_key,1,length(?2)+1)=?2||'.') ORDER BY u.file,u.line,u.id")
+    };
+    let params: [&dyn rusqlite::ToSql; 3] = [&keys, &filter, &refs];
+    let sql = format!("{query} LIMIT {} OFFSET {offset}", limit + 1);
+    let n = conn
+        .prepare(&sql)
+        .map_err(|e| e.to_string())?
+        .parameter_count();
+    let mut result = выборка(conn, &sql, &params[..n])?;
+    page_result(&mut result, limit, offset);
+    result["note"] = json!(if part == "rights_explicit" {
+        "Явные true/false из XML ролей; false не означает запрет при объединении всех ролей. Эффективные права пользователя не вычисляются."
+    } else {
+        "Статически разрешённые источники запросов, поля псевдонимов и типизированные пути форм. Динамические запросы и неоднозначные псевдонимы не разрешены."
+    });
+    Ok(result)
+}
+fn subscription_sources(
+    conn: &Connection,
+    name: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<Value, String> {
+    let raw: Option<(String, String)> = conn
+        .query_row(
+            "SELECT source_types,file FROM event_subscriptions WHERE name=?1",
+            [name],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    let mut rows = Vec::new();
+    if let Some((raw, file)) = raw {
+        let types: Vec<String> = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        let mut st = conn
+            .prepare("SELECT name,type_refs_json FROM defined_types")
+            .map_err(|e| e.to_string())?;
+        let defs: std::collections::HashMap<String, Vec<String>> = st
+            .query_map([], |r| {
+                Ok((
+                    format!("DefinedType.{}", r.get::<_, String>(0)?),
+                    serde_json::from_str::<Vec<String>>(&r.get::<_, String>(1)?)
+                        .unwrap_or_default(),
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(|e| e.to_string())?;
+        for (name, category) in реестр_объектов(conn)? {
+            if let Some(kind) = вид_объекта(&category) {
+                let target = format!("{kind}.{name}");
+                for source in &types {
+                    if subscription_matches(source, &target, &defs, &mut Default::default()) {
+                        rows.push(json!([name, category, source, file]));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let mut result = json!({"columns":["source_object","source_category","via","file"],"rows":rows.into_iter().skip(offset).take(limit+1).collect::<Vec<_>>()});
+    page_result(&mut result, limit, offset);
+    Ok(result)
+}
+
+fn add_subscription_handlers(conn: &Connection, table: &mut Value) -> Result<(), String> {
+    let width = table["columns"].as_array().map_or(0, Vec::len);
+    let Some(rows) = table["rows"].as_array_mut() else {
+        return Ok(());
+    };
+    for row in rows {
+        let module = row[2].as_str().unwrap_or("");
+        let method = row[3].as_str().unwrap_or("");
+        let path = format!("CommonModules/{module}/Ext/Module.bsl");
+        let location:Option<(String,i64)>=conn.query_row("SELECT mo.rel_path,m.line FROM methods m JOIN modules mo ON mo.id=m.module_id WHERE mo.rel_path=?1 AND m.name=?2 COLLATE NOCASE",[&path,method],|r|Ok((r.get(0)?,r.get(1)?))).ok();
+        let row = row.as_array_mut().unwrap();
+        row.resize(width, Value::Null);
+        let index = row.len();
+        let (path, line) = location
+            .map(|(p, l)| (json!(p), json!(l)))
+            .unwrap_or((Value::Null, Value::Null));
+        row.insert(index, path);
+        row.insert(index + 1, line);
+    }
+    let columns = table["columns"].as_array_mut().unwrap();
+    let index = columns.len();
+    columns.insert(index, json!("handler_path"));
+    columns.insert(index + 1, json!("handler_line"));
+    Ok(())
 }
 
 /// Общая карточка: точные типизированные связи и адреса источников.
@@ -1979,7 +2215,7 @@ fn callers(conn: &Connection, args: &Value) -> Result<Value, String> {
         // регламентные задания запускаются платформой, поэтому в таблице calls
         // их принципиально нет; без этого раздела «никто не вызывает» было бы
         // ложным отрицанием.
-        out["platform_entrypoints"] = platform_entrypoints(conn, &method)?;
+        out["platform_entrypoints"] = platform_entrypoints(conn, &method, &корни)?;
     }
     if dir == "out" || dir == "both" {
         let ids: Vec<String> = корни.iter().map(|m| m.0.to_string()).collect();
@@ -2079,8 +2315,12 @@ fn вызывающие(
     Ok(v)
 }
 
-fn platform_entrypoints(conn: &Connection, method: &str) -> Result<Value, String> {
-    выборка(
+fn platform_entrypoints(
+    conn: &Connection,
+    method: &str,
+    roots: &[&МетодВИндексе],
+) -> Result<Value, String> {
+    let mut result = выборка(
         conn,
         "SELECT 'event_subscription' AS kind, name, event AS trigger,
                 handler_module, handler_procedure, file
@@ -2094,7 +2334,18 @@ fn platform_entrypoints(conn: &Connection, method: &str) -> Result<Value, String
             OR method_name = ?1 COLLATE NOCASE
          ORDER BY kind, name",
         &[&method],
-    )
+    )?;
+    let modules: Vec<&str> = roots
+        .iter()
+        .filter_map(|r| {
+            r.2.strip_prefix("CommonModules/")
+                .and_then(|p| p.split('/').next())
+        })
+        .collect();
+    let rows = result["rows"].as_array_mut().unwrap();
+    rows.retain(|r| r[3].as_str().is_some_and(|m| modules.contains(&m)));
+    result["count"] = json!(rows.len());
+    Ok(result)
 }
 
 fn impact(conn: &Connection, args: &Value) -> Result<Value, String> {
@@ -2586,6 +2837,123 @@ mod tests {
     }
 
     #[test]
+    fn запросы_поля_права_и_подписки_из_выгрузки() {
+        let и = ИндексВызовов::новый("navigation");
+        let src = и.0.join("src");
+        let write = |path: &str, text: &str| {
+            let file = src.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, text).unwrap();
+        };
+        write(
+            "Catalogs/Товары.xml",
+            r#"<MetaDataObject><Catalog><Properties><Name>Товары</Name></Properties><ChildObjects><Attribute><Properties><Name>КодТовара</Name><Type><Type>xs:string</Type></Type></Properties></Attribute></ChildObjects></Catalog></MetaDataObject>"#,
+        );
+        write(
+            "Catalogs/Товары/Forms/Форма/Ext/Form.xml",
+            r#"<Form><Attributes><Attribute name="Объект"><Type><Type>cfg:CatalogObject.Товары</Type></Type><MainAttribute>true</MainAttribute></Attribute></Attributes><ChildItems><InputField name="Код"><DataPath>Объект.КодТовара</DataPath></InputField></ChildItems></Form>"#,
+        );
+        write(
+            "Catalogs/Товары/Forms/Форма/Ext/Form/Module.bsl",
+            "Процедура П()\n А = Объект.КодТовара;\n Объект.Записать();\nКонецПроцедуры",
+        );
+        write("CommonModules/Обработчики/Ext/Module.bsl","Процедура П() Экспорт\n Т = \"ВЫБРАТЬ Т.КодТовара ИЗ Справочник.Товары КАК Т\";\nКонецПроцедуры");
+        write("Reports/Тест/Templates/СКД/Ext/Template.xml","<DataCompositionSchema><query>ВЫБРАТЬ Т.КодТовара ИЗ Справочник.Товары КАК Т</query></DataCompositionSchema>");
+        write("Roles/Чтение/Ext/Rights.xml","<Rights><object><name>Catalog.Товары</name><right><name>Read</name><value>false</value></right><right><name>View</name><value>true</value></right></object></Rights>");
+        write("EventSubscriptions/ВесьВид.xml","<MetaDataObject><EventSubscription><Properties><Name>ВесьВид</Name><Source><TypeSet>cfg:CatalogObject</TypeSet></Source><Event>BeforeWrite</Event><Handler>CommonModule.Обработчики.П</Handler></Properties></EventSubscription></MetaDataObject>");
+        gyrfalcon_index::build(&src, &и.0.join("i.db"), None).unwrap();
+        let c = Connection::open(и.0.join("i.db")).unwrap();
+        let card = object(&c, &json!({"name":"Товары"})).unwrap();
+        assert!(
+            card["query_usages"]["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r[2] == "xml_query"),
+            "{card:#}"
+        );
+        assert_eq!(card["rights_explicit"]["count"], 2);
+        let role = object(&c, &json!({"name":"Чтение","category":"Roles"})).unwrap();
+        assert_eq!(role["role_objects"]["count"], 2);
+        assert!(card["rights_explicit"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r[3] == 0));
+        assert_eq!(card["subscriptions"]["count"], 1);
+        let field = object(&c, &json!({"name":"Товары","field":"КодТовара"})).unwrap();
+        let kinds: std::collections::HashSet<_> = field["field_usages"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r[2].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            std::collections::HashSet::from(["form_path", "code_field", "bsl_query", "xml_query"]),
+            "{field:#}"
+        );
+        assert!(!card["field_usages"].to_string().contains("Записать"));
+        let sources = object(
+            &c,
+            &json!({"name":"ВесьВид","category":"EventSubscriptions"}),
+        )
+        .unwrap();
+        assert_eq!(sources["subscription_sources"]["count"], 1, "{sources:#}");
+        assert!(sources["subscription_handler"]
+            .to_string()
+            .contains("CommonModules/Обработчики/Ext/Module.bsl"));
+        let handler = &sources["subscription_handler"];
+        let path_col = handler["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|v| v == "handler_path")
+            .unwrap();
+        assert_eq!(
+            handler["rows"][0][path_col],
+            "CommonModules/Обработчики/Ext/Module.bsl"
+        );
+        assert_eq!(handler["rows"][0][path_col + 1], 1);
+
+        let path = src.join("CommonModules/Обработчики/Ext/Module.bsl");
+        std::fs::write(&path, "Процедура П() Экспорт\nКонецПроцедуры").unwrap();
+        gyrfalcon_index::navigation::refresh(&c, &src, &[path]).unwrap();
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM navigation_usages WHERE kind='bsl_query'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn вложенный_определяемый_тип_и_цикл_подписки() {
+        let defs = std::collections::HashMap::from([
+            ("DefinedType.А".into(), vec!["DefinedType.Б".into()]),
+            (
+                "DefinedType.Б".into(),
+                vec!["DefinedType.А".into(), "CatalogObject".into()],
+            ),
+        ]);
+        assert!(subscription_matches(
+            "DefinedType.А",
+            "Catalog.Товары",
+            &defs,
+            &mut Default::default()
+        ));
+        assert!(!subscription_matches(
+            "DefinedType.А",
+            "Document.Товары",
+            &defs,
+            &mut Default::default()
+        ));
+    }
+
+    #[test]
     fn больше_двух_тысяч_вызывающих_и_связь_обработчика_формы() {
         let и = ИндексВызовов::новый("large-form");
         let src = и.0.join("src");
@@ -2838,7 +3206,7 @@ mod tests {
         );
         let подписки = &v["subscriptions"];
         assert_eq!(
-            подписки["columns"].as_array().unwrap().last(),
+            подписки["columns"].as_array().unwrap().get(6),
             Some(&json!("objects")),
             "{v:#}"
         );
@@ -3465,6 +3833,16 @@ mod tests {
         // а не пустые разделы.
         assert_eq!(card.unwrap()["found"], false);
 
+        let scoped = callers(
+            &c,
+            &json!({"method":"Провести","module":"Documents/Заказ/"}),
+        )
+        .unwrap();
+        assert_eq!(
+            scoped["platform_entrypoints"]["count"], 0,
+            "обработчик общего модуля не принадлежит одноимённому методу документа"
+        );
+        c.execute_batch("INSERT INTO modules(id,rel_path,category,object_name) VALUES(3,'CommonModules/Заказ/Ext/Module.bsl','CommonModules','Заказ'); INSERT INTO methods(id,module_id,name,type,line) VALUES(3,3,'Провести','Procedure',1);").unwrap();
         let method = impact(&c, &json!({"symbol": "Провести", "kind": "method"})).unwrap();
         assert_eq!(
             method["platform_entrypoints"]["rows"]

@@ -56,6 +56,7 @@ pub mod incremental;
 pub mod integration;
 pub mod meta;
 pub mod meta2;
+pub mod navigation;
 pub mod rank;
 pub mod refs;
 pub mod resolve;

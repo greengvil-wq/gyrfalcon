@@ -225,7 +225,7 @@ pub const OWN_TABLES: &[Table] = &[Table {
     purpose: "флаги общих модулей: клиент, сервер, вызов сервера, глобальный",
     reference_rows: 3_437,
     implemented: true,
-}];
+},Table {name:"navigation_usages",purpose:"адресные связи запросов BSL/XML, полей и привязок форм; kind различает чтение и ссылки на типы",reference_rows:0,implemented:true},Table {name:"navigation_rights",purpose:"явные true/false прав ролей, с XML-источником; не эффективные права пользователя",reference_rows:0,implemented:true}];
 
 /// Сколько таблиц уже реализовано.
 pub fn implemented_count() -> usize {
