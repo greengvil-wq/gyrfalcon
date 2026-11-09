@@ -28,6 +28,7 @@ pub fn serve(db: std::path::PathBuf, port: u16) -> Result<(), String> {
             db.display()
         )
     })?;
+    drop(conn);
 
     let addr = format!("127.0.0.1:{port}");
     let listener = TcpListener::bind(&addr)
@@ -40,9 +41,17 @@ pub fn serve(db: std::path::PathBuf, port: u16) -> Result<(), String> {
     for поток in listener.incoming() {
         match поток {
             Ok(s) => {
-                if let Err(e) = обслужить(s, &conn) {
-                    eprintln!("запрос не обслужен: {e}");
-                }
+                // Браузер открывает запасные TCP-соединения без запроса.
+                // Они не должны удерживать очередь остальных вкладок.
+                let db = db.clone();
+                std::thread::spawn(move || match crate::sql::open_readonly(&db) {
+                    Ok(conn) => {
+                        if let Err(e) = обслужить(s, &conn) {
+                            eprintln!("запрос не обслужен: {e}");
+                        }
+                    }
+                    Err(e) => eprintln!("индекс недоступен: {e}"),
+                });
             }
             Err(e) => eprintln!("соединение не принято: {e}"),
         }
@@ -51,6 +60,8 @@ pub fn serve(db: std::path::PathBuf, port: u16) -> Result<(), String> {
 }
 
 fn обслужить(mut s: TcpStream, conn: &Connection) -> std::io::Result<()> {
+    s.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    s.set_write_timeout(Some(std::time::Duration::from_secs(10)))?;
     let mut r = BufReader::new(s.try_clone()?);
     let mut строка = String::new();
     r.read_line(&mut строка)?;
