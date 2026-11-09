@@ -169,8 +169,8 @@ fn explore(conn: &Connection, query: &str) -> Result<serde_json::Value, String> 
             args = serde_json::from_str(&decode_component(value)?).map_err(|e| e.to_string())?;
         }
     }
-    if !["find", "object", "callers", "read"].contains(&tool.as_str()) {
-        return Err("доступны find, object, callers, read".into());
+    if !["find", "object", "callers", "read", "navigation"].contains(&tool.as_str()) {
+        return Err("доступны find, object, callers, read, navigation".into());
     }
     crate::tools::call(conn, crate::tools::Profile::Analysis, &tool, &args)
 }

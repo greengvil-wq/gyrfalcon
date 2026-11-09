@@ -50,6 +50,7 @@ impl Profile {
         // разрушающая операция сервера, и она доступна только профилю
         // `all`. Роль, чьё дело — читать, стирать индексы не должна.
         const ANALYSIS: &[&str] = &[
+            "navigation",
             "list_projects",
             "kb_1c",
             "project_practices",
@@ -76,6 +77,7 @@ impl Profile {
         // профилем. Индекс ему нужен (имена сверяются по нему), поэтому под
         // общее стоп-условие «нет индекса — нет работы» он попадает сам.
         const SCOUT: &[&str] = &[
+            "navigation",
             "list_projects",
             "kb_1c",
             "project_practices",
@@ -108,6 +110,11 @@ pub struct Tool {
 ///
 /// Порядок — от частого к редкому: он же порядок в выдаче `tools/list`.
 pub const TOOLS: &[Tool] = &[
+    Tool {
+        name: "navigation",
+        description: "Навигация по точным адресам объектов и процедур. mode=search — гибридный поиск кандидатов; graph — два входящих уровня до узла и два исходящих после; path — объяснить направленную цепочку до двух переходов с файлами, строками и фрагментами; context — компактный пакет для ИИ с бюджетом символов и явным продолжением. Режимы связей: code, data, structure, forms, rights, all. Структура и права не означают влияние на выполнение кода.",
+        schema: crate::connection_graph::schema,
+    },
     Tool {
         name: "list_projects",
         description: "Какие конфигурации 1С обслуживает этот сервер: имя, каталог              исходников, число модулей и методов, время сборки индекса. Спрашивать              ПЕРВЫМ, когда неизвестно, что подставлять в параметр project.              Отвечает про реестр сервера, а не про содержимое конфигураций.",
@@ -475,6 +482,7 @@ pub fn call(
         ));
     }
     match name {
+        "navigation" => crate::connection_graph::navigate(conn, args),
         "kb_1c" => crate::kb_1c::search(conn, args),
         "project_practices" => crate::project_practices::profile(conn, args),
         "standards_1c" => crate::standards_1c::search(conn, args),

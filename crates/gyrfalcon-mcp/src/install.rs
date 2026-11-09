@@ -292,6 +292,7 @@ impl Tier {
     fn инструменты(self) -> &'static [&'static str] {
         match self {
             Tier::Scout => &[
+                "navigation",
                 "list_projects",
                 "kb_1c",
                 "project_practices",
@@ -306,6 +307,7 @@ impl Tier {
                 "check_bsl",
             ],
             Tier::Verify => &[
+                "navigation",
                 "list_projects",
                 "kb_1c",
                 "project_practices",
@@ -325,6 +327,7 @@ impl Tier {
                 "check_bsl",
             ],
             Tier::Auditor => &[
+                "navigation",
                 "list_projects",
                 "delete_project",
                 "kb_1c",

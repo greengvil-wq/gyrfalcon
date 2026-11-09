@@ -9,7 +9,8 @@ const elements=new Map(),pending=[];
 const context=vm.createContext({AbortController,URLSearchParams,TypeError,
   $:id=>{if(!elements.has(id))elements.set(id,{style:{},hidden:false,textContent:'',replaceChildren(){}});return elements.get(id)},
   fetch:()=>new Promise((resolve,reject)=>pending.push({resolve,reject}))});
-vm.runInContext(`let map=null,mapSeq=0,mapAbort=null,mapRoot=0,mapSelected=0,mapKeys=new Map(),mapVisible=[],mapEdges=[],mapEdgesSet=new Set(),mapPositions=[],mapAdj=[],mapParent=[],mapDistance=[],mapGrid=new Map(),mapIncoming=[],mapOutgoing=[];
+const declaration=html.slice(html.indexOf('let map=null'),html.indexOf('\nconst nodeKinds'));
+vm.runInContext(`${declaration}
 let painted=null;
 function paintMap(){painted=map?.nodes[map.root][0]??null}
 function renderGraph(){paintMap()}

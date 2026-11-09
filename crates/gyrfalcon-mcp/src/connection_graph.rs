@@ -5,6 +5,22 @@ use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 
+pub fn schema() -> Value {
+    json!({"type":"object","properties":{
+        "project":{"type":"string"},
+        "mode":{"type":"string","enum":["search","graph","path","context"],"default":"context"},
+        "query":{"type":"string"},"kind":{"type":"string","enum":["any","object","method","module"]},
+        "key":{"type":"string","description":"Канонический адрес из graph; приоритет над name"},
+        "name":{"type":"string"},"category":{"type":"string"},"module":{"type":"string"},"field":{"type":"string"},
+        "from":{"type":"string"},"to":{"type":"string"},
+        "relationship_mode":{"type":"string","enum":["all","code","data","structure","forms","rights"],"default":"all"},
+        "include_denied_rights":{"type":"boolean","default":true},
+        "offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":100},
+        "max_chars":{"type":"integer","minimum":2000,"maximum":64000,"default":16000},
+        "evidence_offset":{"type":"integer","minimum":0},"evidence_limit":{"type":"integer","minimum":1,"maximum":50}
+    }})
+}
+
 #[derive(Clone)]
 struct Node {
     key: String,
@@ -23,6 +39,7 @@ struct Edge {
     file: Option<usize>,
     line: i64,
     count: usize,
+    evidence: Vec<(Option<usize>, i64)>,
 }
 #[derive(Default)]
 struct Graph {
@@ -186,13 +203,17 @@ impl Graph {
         }
         let id = self.kinds.len();
         self.kind_keys.insert(code.into(), id);
-        self.kinds.push(json!([code, label, group]));
+        self.kinds
+            .push(json!([code, label, group, relationship_layer(code, group)]));
         id
     }
     fn edge(&mut self, a: usize, b: usize, kind: usize, file: &str, line: i64) {
         let source = self.file(file);
         if let Some(i) = self.edge_keys.get(&(a, b, kind)) {
             self.edges[*i].count += 1;
+            if !self.edges[*i].evidence.contains(&(source, line)) {
+                self.edges[*i].evidence.push((source, line));
+            }
             return;
         }
         let id = self.edges.len();
@@ -204,6 +225,7 @@ impl Graph {
             file: source,
             line,
             count: 1,
+            evidence: vec![(source, line)],
         });
     }
     fn object(&mut self, cat: &str, name: &str) -> usize {
@@ -219,7 +241,7 @@ impl Graph {
         let id = self.node(key, 4, name, &parent.category, &file, 0, Some(owner), name);
         let k = self.kind("contains_field", "Содержит поле / значение", "metadata");
         if !self.edge_keys.contains_key(&(owner, id, k)) {
-            self.edge(owner, id, k, "", 0);
+            self.edge(owner, id, k, &file, 0);
         }
         id
     }
@@ -869,9 +891,371 @@ fn directed_distances(graph: &Graph, root: usize, incoming: bool) -> Vec<usize> 
 fn in_scope(e: &Edge, incoming: &[usize], outgoing: &[usize]) -> bool {
     (incoming[e.to] < 2 && incoming[e.from] <= 2) || (outgoing[e.from] < 2 && outgoing[e.to] <= 2)
 }
-pub fn data(conn: &Connection, args: &Value) -> Result<Value, String> {
-    let start = std::time::Instant::now();
-    let graph = build(conn)?;
+fn relationship_layer(code: &str, group: &str) -> &'static str {
+    if code == "contains_form" {
+        return "forms";
+    }
+    if matches!(code, "contains_module" | "contains_method") {
+        return "code";
+    }
+    if code.starts_with("right:") || code == "metadata:role_rights" {
+        "rights"
+    } else if code.starts_with("contains_")
+        || matches!(code, "subsystem" | "type_membership" | "exchange_content")
+    {
+        "structure"
+    } else if code.starts_with("navigation:")
+        || matches!(code, "register_movement" | "code:query" | "code:manager")
+    {
+        "data"
+    } else if matches!(
+        code,
+        "call"
+            | "notification"
+            | "platform_handler"
+            | "subscription_source"
+            | "override"
+            | "metadata:event_subscription_source"
+    ) {
+        "code"
+    } else if group == "forms" {
+        "forms"
+    } else {
+        "structure"
+    }
+}
+struct Policy {
+    mode: String,
+    include_denied: bool,
+}
+impl Policy {
+    fn parse(args: &Value) -> Result<Self, String> {
+        let mode = args["relationship_mode"].as_str().unwrap_or("all");
+        if !["all", "code", "data", "structure", "forms", "rights"].contains(&mode) {
+            return Err("неизвестный режим связей".into());
+        }
+        Ok(Self {
+            mode: mode.into(),
+            include_denied: args["include_denied_rights"].as_bool().unwrap_or(true),
+        })
+    }
+    fn allows(&self, e: &Edge, kinds: &[Value]) -> bool {
+        let code = kinds[e.kind][0].as_str().unwrap_or("");
+        (self.mode == "all" || kinds[e.kind][3] == self.mode)
+            && (self.include_denied || !(code.starts_with("right:") && code.ends_with(":false")))
+    }
+}
+fn qualified_name(g: &Graph, id: usize) -> String {
+    let n = &g.nodes[id];
+    match n.kind {
+        0 => format!("{}.{}", n.category, n.name),
+        1 | 2 => {
+            let file = n.file.map(|i| g.files[i].as_str()).unwrap_or("");
+            let prefix = file
+                .trim_end_matches(".bsl")
+                .replace("/Ext/", "/")
+                .replace('/', ".");
+            if n.kind == 2 {
+                format!("{prefix}.{}", n.name)
+            } else {
+                prefix
+            }
+        }
+        _ => n
+            .owner
+            .map(|o| format!("{}.{}", qualified_name(g, o), n.name))
+            .unwrap_or_else(|| n.name.clone()),
+    }
+}
+fn node_card(g: &Graph, id: usize) -> Value {
+    let n = &g.nodes[id];
+    json!({"key":n.key,"name":n.name,"qualified_name":qualified_name(g,id),"kind":n.kind,"category":n.category,"file":n.file.map(|f|g.files[f].clone()),"line":n.line,"owner":n.owner.map(|o|g.nodes[o].key.clone())})
+}
+#[derive(Default)]
+struct Sources {
+    root: Option<std::path::PathBuf>,
+    files: HashMap<String, Vec<String>>,
+}
+impl Sources {
+    fn new(conn: &Connection) -> Self {
+        let root: Option<String> = conn
+            .query_row(
+                "SELECT value FROM index_meta WHERE key='source_path'",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        Self {
+            root: root.and_then(|r| std::fs::canonicalize(r).ok()),
+            files: HashMap::new(),
+        }
+    }
+    fn snippet(&mut self, file: &str, line: i64) -> Option<Value> {
+        if line < 1 {
+            return None;
+        }
+        if !self.files.contains_key(file) {
+            let root = self.root.as_ref()?;
+            let path = std::fs::canonicalize(root.join(file)).ok()?;
+            if !path.starts_with(root) {
+                return None;
+            }
+            let raw = std::fs::read_to_string(path).ok()?;
+            self.files
+                .insert(file.into(), raw.lines().map(str::to_string).collect());
+        }
+        let lines = self.files.get(file)?;
+        let start = (line as usize).saturating_sub(3);
+        let end = (line as usize + 3).min(lines.len());
+        if start >= end {
+            return None;
+        }
+        let text: String = lines[start..end].join("\n").chars().take(1800).collect();
+        Some(json!({"start_line":start+1,"text":text}))
+    }
+}
+fn edge_proof(g: &Graph, e: &Edge, sources: &mut Sources, offset: usize, limit: usize) -> Value {
+    let evidence: Vec<_> = e
+        .evidence
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(|(file, line)| {
+            let file = file.or(g.nodes[e.from].file).or(g.nodes[e.to].file).map(|f| g.files[f].as_str()).unwrap_or("");
+            json!({"file":file,"line":line,"location_kind":if *line>0 {"occurrence"} else {"metadata_address"},"snippet":sources.snippet(file,*line)})
+        })
+        .collect();
+    let end = (offset + evidence.len()).min(e.evidence.len());
+    json!({"from":node_card(g,e.from),"to":node_card(g,e.to),"kind":g.kinds[e.kind][0],"label":g.kinds[e.kind][1],"layer":g.kinds[e.kind][3],"occurrences":e.count,"evidence":evidence,"evidence_total":e.evidence.len(),"has_more_evidence":end<e.evidence.len(),"next_offset":end})
+}
+/// One read-only MCP surface for bounded graphs, proven paths and compact AI context.
+pub fn navigate(conn: &Connection, args: &Value) -> Result<Value, String> {
+    if args["mode"] == "search" {
+        return search_candidates(conn, args);
+    }
+    let snapshot = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let mode = args["mode"].as_str().unwrap_or("context");
+    if mode == "graph" {
+        let result = data(&snapshot, args)?;
+        snapshot.commit().map_err(|e| e.to_string())?;
+        return Ok(result);
+    }
+    let mut g = build(&snapshot)?;
+    let policy = Policy::parse(args)?;
+    g.edges.retain(|e| policy.allows(e, &g.kinds));
+    let mut sources = Sources::new(&snapshot);
+    let result = match mode {
+        "path" => {
+            let from = args["from"]
+                .as_str()
+                .and_then(|k| g.keys.get(k))
+                .copied()
+                .ok_or("нужен точный from из graph/search")?;
+            let to = args["to"]
+                .as_str()
+                .and_then(|k| g.keys.get(k))
+                .copied()
+                .ok_or("нужен точный to из graph/search")?;
+            let path = proven_path(&g, from, to);
+            let offset = args["evidence_offset"].as_u64().unwrap_or(0) as usize;
+            let limit = args["evidence_limit"].as_u64().unwrap_or(5).clamp(1, 50) as usize;
+            match path {
+                Some(path) => {
+                    json!({"found":true,"from":node_card(&g,from),"to":node_card(&g,to),"hops":path.len(),"max_hops":2,"steps":path.iter().map(|i|edge_proof(&g,&g.edges[*i],&mut sources,offset,limit)).collect::<Vec<_>>(),"note":"Каждая стрелка подтверждается индексом. Структура и права сами по себе не доказывают влияние на выполнение кода."})
+                }
+                None => {
+                    json!({"found":false,"max_hops":2,"note":"Направленный путь до двух переходов в выбранном режиме не найден. Это не доказывает отсутствия динамической связи."})
+                }
+            }
+        }
+        "context" => compact_context(&g, root_id(&g, args)?, args, &mut sources)?,
+        _ => return Err("mode: graph, path, context или search".into()),
+    };
+    snapshot.commit().map_err(|e| e.to_string())?;
+    Ok(result)
+}
+fn proven_path(g: &Graph, from: usize, to: usize) -> Option<Vec<usize>> {
+    let mut adjacent = vec![Vec::new(); g.nodes.len()];
+    for (i, e) in g.edges.iter().enumerate() {
+        adjacent[e.from].push(i);
+    }
+    let mut distance = vec![usize::MAX; g.nodes.len()];
+    let mut parent = vec![None; g.nodes.len()];
+    let mut q = VecDeque::from([from]);
+    distance[from] = 0;
+    while let Some(id) = q.pop_front() {
+        if id == to {
+            break;
+        }
+        if distance[id] >= 2 {
+            continue;
+        }
+        for i in &adjacent[id] {
+            let e = &g.edges[*i];
+            if distance[e.to] == usize::MAX {
+                distance[e.to] = distance[id] + 1;
+                parent[e.to] = Some(*i);
+                q.push_back(e.to);
+            }
+        }
+    }
+    if distance[to] == usize::MAX {
+        return None;
+    }
+    let mut path = Vec::new();
+    let mut id = to;
+    while id != from {
+        let i = parent[id]?;
+        path.push(i);
+        id = g.edges[i].from;
+    }
+    path.reverse();
+    Some(path)
+}
+fn compact_context(
+    g: &Graph,
+    root: usize,
+    args: &Value,
+    sources: &mut Sources,
+) -> Result<Value, String> {
+    let incoming = directed_distances(g, root, true);
+    let outgoing = directed_distances(g, root, false);
+    let mut selected: Vec<_> = g
+        .edges
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| in_scope(e, &incoming, &outgoing))
+        .collect();
+    selected.sort_by_key(|(i, e)| {
+        let layer = g.kinds[e.kind][3].as_str().unwrap_or("");
+        (
+            usize::from(e.from != root && e.to != root),
+            match layer {
+                "code" => 0,
+                "data" => 1,
+                "forms" => 2,
+                "structure" => 3,
+                _ => 4,
+            },
+            *i,
+        )
+    });
+    let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+    let limit = args["limit"].as_u64().unwrap_or(12).clamp(1, 50) as usize;
+    let budget = args["max_chars"]
+        .as_u64()
+        .unwrap_or(16000)
+        .clamp(2000, 64000) as usize;
+    let mut connections = Vec::new();
+    let scope_nodes = incoming
+        .iter()
+        .zip(&outgoing)
+        .filter(|(a, b)| **a != usize::MAX || **b != usize::MAX)
+        .count();
+    let mut result = json!({"root":node_card(g,root),"scope":"directed_2_before_2_after","scope_nodes":scope_nodes,"scope_connections":selected.len(),"connections":[],"has_more":offset<selected.len(),"next_offset":offset,"omitted":selected.len().saturating_sub(offset),"max_chars":budget,"uncertainties":["Индекс статический: динамические обращения могут отсутствовать.","Каждая связь имеет вид и источник; достижимость через структуру/права не равна влиянию на код.","Фрагменты прочитаны из текущих файлов; после их изменения нужно обновить индекс."]});
+    for (_, e) in selected.iter().skip(offset).take(limit) {
+        let proof = edge_proof(g, e, sources, 0, 1);
+        connections.push(proof);
+        result["connections"] = json!(connections);
+        let next = offset + connections.len();
+        result["next_offset"] = json!(next);
+        result["has_more"] = json!(next < selected.len());
+        result["omitted"] = json!(selected.len().saturating_sub(next));
+        if result.to_string().chars().count() > budget {
+            connections.pop();
+            result["connections"] = json!(connections);
+            let next = offset + connections.len();
+            result["next_offset"] = json!(next);
+            result["has_more"] = json!(next < selected.len());
+            result["omitted"] = json!(selected.len().saturating_sub(next));
+            break;
+        }
+    }
+    // A small budget must still allow progress through unusually long names/snippets.
+    if connections.is_empty() && offset < selected.len() {
+        let e = selected[offset].1;
+        result["connections"] = json!([{"from":g.nodes[e.from].key,"to":g.nodes[e.to].key,"kind":g.kinds[e.kind][0],"file":e.file.map(|i|g.files[i].clone()),"line":e.line,"note":"Подробности не поместились в бюджет; запросите path по этим ключам."}]);
+        result["next_offset"] = json!(offset + 1);
+        result["has_more"] = json!(offset + 1 < selected.len());
+        result["omitted"] = json!(selected.len() - offset - 1);
+    }
+    result["returned_chars"] = json!(0);
+    for _ in 0..3 {
+        result["returned_chars"] = json!(result.to_string().chars().count());
+    }
+    Ok(result)
+}
+fn search_candidates(conn: &Connection, args: &Value) -> Result<Value, String> {
+    let mut query = args.clone();
+    query["semantic"] = json!(true);
+    let mut result = crate::tools::call(conn, crate::tools::Profile::Analysis, "find", &query)?;
+    let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 100) as usize;
+    let mut hydrated = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    if let Some(rows) = result["rows"].as_array() {
+        for row in rows {
+            let kind = row[1].as_str().unwrap_or("");
+            let name = row[0].as_str().unwrap_or("");
+            let mut variants = Vec::new();
+            if row[4].as_array().is_some_and(|a| !a.is_empty()) {
+                variants.push(row[4].clone());
+            } else if kind == "method" {
+                let mut st=conn.prepare("SELECT m.type,m.is_export,mo.rel_path,m.line FROM methods m JOIN modules mo ON mo.id=m.module_id WHERE m.name=?1 COLLATE NOCASE ORDER BY mo.rel_path,m.line").map_err(|e|e.to_string())?;
+                let mapped = st
+                    .query_map([name], |r| {
+                        Ok(json!([
+                            r.get::<_, String>(0)?,
+                            r.get::<_, i64>(1)?.to_string(),
+                            r.get::<_, String>(2)?,
+                            r.get::<_, i64>(3)?.to_string()
+                        ]))
+                    })
+                    .map_err(|e| e.to_string())?;
+                for r in mapped {
+                    variants.push(r.map_err(|e| e.to_string())?);
+                }
+            } else if kind == "object" {
+                let mut st=conn.prepare("SELECT category,COALESCE(synonym,'') FROM object_synonyms WHERE object_name=?1 COLLATE NOCASE ORDER BY category").map_err(|e|e.to_string())?;
+                let mapped = st
+                    .query_map([name], |r| {
+                        Ok(json!([r.get::<_, String>(0)?, r.get::<_, String>(1)?]))
+                    })
+                    .map_err(|e| e.to_string())?;
+                for r in mapped {
+                    variants.push(r.map_err(|e| e.to_string())?);
+                }
+            }
+            for details in variants {
+                let mut row = row.clone();
+                row[4] = details;
+                let key = json!([row[0], row[1], row[4]]).to_string();
+                if seen.insert(key) {
+                    hydrated.push(row);
+                }
+            }
+        }
+    }
+    let total = hydrated.len();
+    hydrated.truncate(limit);
+    let dictionary: i64 = conn
+        .query_row("SELECT count(*) FROM semantic_dictionary", [], |r| r.get(0))
+        .unwrap_or(0);
+    result["rows"] = json!(hydrated);
+    result["found"] = json!(hydrated.len());
+    result["has_more"] = json!(total > hydrated.len());
+    result["search_mode"] = json!(if dictionary > 0 {
+        "lexical_and_dictionary"
+    } else {
+        "lexical_and_hashed_tokens"
+    });
+    result["note"] = json!(if dictionary > 0 {
+        "Кандидаты по имени, синонимам и словарной близости; связи проверяйте отдельно."
+    } else {
+        "Кандидаты по имени, синонимам и близости токенов. Словарь эмбеддингов отсутствует: это не нейросетевое понимание текста."
+    });
+    Ok(result)
+}
+fn root_id(graph: &Graph, args: &Value) -> Result<usize, String> {
     let requested = if let Some(key) = args["key"].as_str() {
         key.to_string()
     } else {
@@ -897,6 +1281,14 @@ pub fn data(conn: &Connection, args: &Value) -> Result<Value, String> {
         .keys
         .get(&requested)
         .ok_or("узел не найден в индексе связей")?;
+    Ok(root)
+}
+pub fn data(conn: &Connection, args: &Value) -> Result<Value, String> {
+    let start = std::time::Instant::now();
+    let mut graph = build(conn)?;
+    let root = root_id(&graph, args)?;
+    let policy = Policy::parse(args)?;
+    graph.edges.retain(|e| policy.allows(e, &graph.kinds));
     let incoming = directed_distances(&graph, root, true);
     let outgoing = directed_distances(&graph, root, false);
     let distance: Vec<_> = incoming
@@ -932,7 +1324,10 @@ pub fn data(conn: &Connection, args: &Value) -> Result<Value, String> {
                 n.field,
                 distance[*i],
                 (incoming[*i] != usize::MAX).then_some(incoming[*i]),
-                (outgoing[*i] != usize::MAX).then_some(outgoing[*i])
+                (outgoing[*i] != usize::MAX).then_some(outgoing[*i]),
+                qualified_name(&graph, *i),
+                n.owner.map(|o| graph.nodes[o].key.clone()),
+                n.owner.map(|o| qualified_name(&graph, o))
             ])
         })
         .collect();
@@ -948,13 +1343,67 @@ pub fn data(conn: &Connection, args: &Value) -> Result<Value, String> {
         .collect();
     let unresolved:i64=conn.query_row("SELECT count(*) FROM calls WHERE callee_key IS NULL AND resolution NOT IN ('platform_var','platform_global')",[],|r|r.get(0)).unwrap_or(0);
     Ok(
-        json!({"root":remap[root],"nodes":nodes,"edges":edges,"files":graph.files,"kinds":graph.kinds,"node_columns":["key","kind","name","category","file","line","owner","field","distance","incoming_distance","outgoing_distance"],"edge_columns":["from","to","kind","file","line","occurrences"],"complete_in_index":!limited,"complete_in_scope":true,"max_depth":2,"incoming_depth":2,"outgoing_depth":2,"scope":"directed_2_before_2_after","limited_by_depth":limited,"truncated":limited,"occurrences":occurrences,"index_nodes":graph.nodes.len(),"index_edges":graph.edges.len(),"unresolved_calls_in_index":unresolved,"warnings":graph.warnings,"elapsed_ms":start.elapsed().as_millis(),"note":"До двух входящих переходов перед текущим узлом и двух исходящих после него. Направление внутри цепочки не меняется. Циклы обходятся один раз. Неразрешённые вызовы не считаются доказанными связями. false в роли не означает глобальный запрет."}),
+        json!({"relationship_mode":policy.mode,"include_denied_rights":policy.include_denied,"root":remap[root],"nodes":nodes,"edges":edges,"files":graph.files,"kinds":graph.kinds,"node_columns":["key","kind","name","category","file","line","owner","field","distance","incoming_distance","outgoing_distance","qualified_name","owner_key","owner_label"],"edge_columns":["from","to","kind","file","line","occurrences"],"complete_in_index":!limited,"complete_in_scope":true,"max_depth":2,"incoming_depth":2,"outgoing_depth":2,"scope":"directed_2_before_2_after","limited_by_depth":limited,"truncated":limited,"occurrences":occurrences,"index_nodes":graph.nodes.len(),"index_edges":graph.edges.len(),"unresolved_calls_in_index":unresolved,"warnings":graph.warnings,"elapsed_ms":start.elapsed().as_millis(),"note":"До двух входящих переходов перед текущим узлом и двух исходящих после него. Направление внутри цепочки не меняется. Циклы обходятся один раз. Неразрешённые вызовы не считаются доказанными связями. false в роли не означает глобальный запрет."}),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn полные_подписи_и_режимы_не_смешивают_реквизиты_и_права() {
+        let mut g = Graph::default();
+        let a = g.object("Catalogs", "Ошибки");
+        let b = g.object("Catalogs", "Идеи");
+        let fa = g.field(a, "РазделПроекта");
+        let fb = g.field(b, "РазделПроекта");
+        assert_ne!(qualified_name(&g, fa), qualified_name(&g, fb));
+        let role = g.object("Roles", "Просмотр");
+        let k = g.kind("right:Read:false", "Не выдано", "metadata");
+        g.edge(role, fa, k, "rights.xml", 10);
+        let policy = Policy::parse(&json!({"relationship_mode":"data"})).unwrap();
+        assert!(!policy.allows(g.edges.last().unwrap(), &g.kinds));
+        let policy =
+            Policy::parse(&json!({"relationship_mode":"rights","include_denied_rights":false}))
+                .unwrap();
+        assert!(!policy.allows(g.edges.last().unwrap(), &g.kinds));
+        assert_eq!(relationship_layer("contains_form", "forms"), "forms");
+    }
+    #[test]
+    fn объяснение_сохраняет_все_источники_а_контекст_соблюдает_бюджет() {
+        let mut g = Graph::default();
+        let root = g.object("CommonModules", "Модуль");
+        let k = g.kind("call", "Вызов", "code");
+        for i in 0..80 {
+            let next = g.object("CommonModules", &format!("Цель{i}"));
+            g.edge(root, next, k, "Модуль.bsl", i + 1);
+        }
+        let target = g.edges[0].to;
+        g.edge(root, target, k, "Модуль.bsl", 100);
+        let path = proven_path(&g, root, target).unwrap();
+        assert_eq!(path.len(), 1);
+        let mut sources = Sources::default();
+        let first = edge_proof(&g, &g.edges[path[0]], &mut sources, 0, 1);
+        assert_eq!(first["evidence_total"], 2);
+        assert_eq!(first["has_more_evidence"], true);
+        let second = edge_proof(&g, &g.edges[path[0]], &mut sources, 1, 1);
+        assert_eq!(second["evidence"][0]["line"], 100);
+        assert!(proven_path(&g, target, root).is_none());
+        let context = compact_context(
+            &g,
+            root,
+            &json!({"max_chars":4000,"limit":50}),
+            &mut sources,
+        )
+        .unwrap();
+        assert!(context.to_string().chars().count() <= 4000);
+        assert_eq!(
+            context["returned_chars"].as_u64().unwrap() as usize,
+            context.to_string().chars().count()
+        );
+        assert!(context["next_offset"].as_u64().unwrap() > 0);
+        assert_eq!(context["has_more"], true);
+    }
     #[test]
     fn два_до_и_два_после_без_смены_направления() {
         let mut g = Graph::default();

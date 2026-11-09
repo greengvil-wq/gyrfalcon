@@ -159,6 +159,12 @@ fn key_of(rel_path: &str, method: &str) -> String {
 ///
 /// `caller_module` — путь модуля, откуда идёт вызов: нужен для локальных имён.
 pub fn resolve(name: &str, caller_module: &str, t: &ResolveTables) -> ResolvedCall {
+    // A literal BSP common-module accessor is an exact address, not a variable.
+    if let Some((module, method)) = literal_common_module_call(name) {
+        let mut result = resolve(&format!("{module}.{method}"), caller_module, t);
+        result.callee_name = name.to_string();
+        return result;
+    }
     if let Some(target) = name.strip_prefix("$notification$") {
         let mut result = resolve(target, caller_module, t);
         result.callee_name = name.to_string();
@@ -252,6 +258,38 @@ pub fn resolve(name: &str, caller_module: &str, t: &ResolveTables) -> ResolvedCa
     }
 }
 
+fn literal_common_module_call(name: &str) -> Option<(&str, &str)> {
+    let (access, method) = name.rsplit_once(".")?;
+    if method.is_empty() || !method.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    let (factory, argument) = access.split_once('(')?;
+    let factory = factory.trim().to_lowercase();
+    if ![
+        "общиймодуль",
+        "commonmodule",
+        "общегоназначения.общиймодуль",
+        "общегоназначенияклиент.общиймодуль",
+        "общегоназначениясервер.общиймодуль",
+        "общегоназначенияклиентсервер.общиймодуль",
+        "общегоназначенияповтисп.общиймодуль",
+    ]
+    .contains(&factory.as_str())
+    {
+        return None;
+    }
+    let module = argument
+        .trim()
+        .strip_suffix(')')?
+        .trim()
+        .strip_prefix('"')?
+        .strip_suffix('"')?;
+    if module.is_empty() || !module.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some((module, method))
+}
+
 /// Счётчики по классам — то, чем меряется контрольная точка вехи 2.
 #[derive(Debug, Clone, Default)]
 pub struct ResolutionStats {
@@ -326,6 +364,20 @@ impl ResolutionStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bsp_литеральный_общий_модуль_разрешается_без_угадывания_выражений() {
+        let t = tables();
+        let name = "ОбщегоНазначения.ОбщийМодуль(\"ОбщегоНазначения\").ЗначениеРеквизита";
+        let result = resolve(name, "Catalogs/Товар/Ext/ObjectModule.bsl", &t);
+        assert_eq!(
+            result.callee_key.as_deref(),
+            Some("CommonModules/ОбщегоНазначения/Ext/Module.bsl::значениереквизита")
+        );
+        assert_eq!(result.callee_name, name);
+        assert!(literal_common_module_call("ОбщийМодуль(Имя).Метод").is_none());
+        assert!(literal_common_module_call("ОбщийМодуль(\"М\" + Суффикс).Метод").is_none());
+        assert!(literal_common_module_call("Произвольный.ОбщийМодуль(\"М\").Метод").is_none());
+    }
 
     fn tables() -> ResolveTables {
         let mut t = ResolveTables::default();
