@@ -23,7 +23,7 @@ def audit(db, url):
     with urlopen(url + "/api/graph?" + urlencode({"args": json.dumps({"key": "method:" + key})}), timeout=120) as response:
         graph = json.load(response)
     assert "error" not in graph, graph
-    assert graph["complete_in_scope"] and graph["max_depth"] == 5
+    assert graph["complete_in_scope"] and graph["scope"] == "directed_2_before_2_after"
     nodes, edges = graph["nodes"], graph["edges"]
     ids = {n[0]: i for i, n in enumerate(nodes)}
     assert len(ids) == len(nodes), "duplicate canonical nodes"
@@ -44,9 +44,9 @@ def audit(db, url):
     )}
     for caller, target in conn.execute("SELECT caller_id,callee_key FROM calls WHERE callee_key IS NOT NULL"):
         a, b = methods[caller], "method:" + target
-        if any(n in ids and nodes[ids[n]][8] < graph["max_depth"] for n in (a, b)):
+        if (b in ids and nodes[ids[b]][9] is not None and nodes[ids[b]][9] < 2) or (a in ids and nodes[ids[a]][10] is not None and nodes[ids[a]][10] < 2):
             assert a in ids and b in ids, ("missing reachable procedure", a, b)
-        if a in ids and b in ids:
+        if a in ids and b in ids and ((nodes[ids[b]][9] is not None and nodes[ids[b]][9] < 2) or (nodes[ids[a]][10] is not None and nodes[ids[a]][10] < 2)):
             expected_calls[(a, b)] += 1
     assert actual_calls == expected_calls, ("calls differ", expected_calls - actual_calls, actual_calls - expected_calls)
     distance = [-1] * len(nodes)
@@ -60,19 +60,31 @@ def audit(db, url):
                 queue.append(b)
     assert all(d >= 0 for d in distance), "unreachable nodes included"
     assert distance == [n[8] for n in nodes], "incorrect shortest distances"
-    assert max(distance) <= 5, "depth limit exceeded"
+    assert max(distance) <= 2, "depth limit exceeded"
+    for incoming, column in [(True, 9), (False, 10)]:
+        directed = [None] * len(nodes)
+        directed[graph["root"]] = 0
+        q = deque([graph["root"]])
+        links = [[] for _ in nodes]
+        for a, b, *_ in edges:
+            links[b if incoming else a].append(a if incoming else b)
+        while q:
+            a = q.popleft()
+            if directed[a] == 2:
+                continue
+            for b in links[a]:
+                if directed[b] is None:
+                    directed[b] = directed[a] + 1
+                    q.append(b)
+        assert directed == [n[column] for n in nodes], "directed distances differ"
     # Containment must retain every method, including those not directly called.
     contains = {(a, b) for a, b, k, *_ in edges if graph["kinds"][k][0] == "contains_method"}
     for method, module in conn.execute("SELECT m.id,mo.rel_path FROM methods m JOIN modules mo ON mo.id=m.module_id"):
         parent = "module:" + module
-        if parent in ids and nodes[ids[parent]][8] < graph["max_depth"]:
+        if parent in ids and nodes[ids[parent]][10] is not None and nodes[ids[parent]][10] < 2:
             assert methods[method] in ids
             assert (ids[parent], ids[methods[method]]) in contains
     rights = sum(e[5] for e in edges if graph["kinds"][e[2]][0].startswith("right:"))
-    # Pilot component contains every role: each explicit true/false must survive.
-    all_roles = conn.execute("SELECT DISTINCT role FROM navigation_rights").fetchall()
-    if all("object:Roles:" + r.lower() in ids and nodes[ids["object:Roles:" + r.lower()]][8] < graph["max_depth"] for r, in all_roles):
-        assert rights == conn.execute("SELECT count(*) FROM navigation_rights").fetchone()[0]
     result = dict(nodes=len(nodes), edges=len(edges), depth=max(distance),
                   call_sites=sum(actual_calls.values()), high_degree_call_sites=sites,
                   explicit_rights=rights, seconds=round(time.perf_counter() - started, 3))

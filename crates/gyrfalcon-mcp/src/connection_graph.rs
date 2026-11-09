@@ -1,4 +1,4 @@
-//! Карта связей до пяти переходов от корня без ограничения числа соседей.
+//! Два входящих перехода до корня и два исходящих после, без смены направления.
 //! Строки источников агрегируются по паре узлов и виду связи; число вхождений
 //! сохраняется. Неразрешённые вызовы не превращаются в выдуманные зависимости.
 use rusqlite::Connection;
@@ -814,6 +814,7 @@ fn build(conn: &Connection) -> Result<Graph, String> {
     Ok(g)
 }
 
+#[cfg(test)]
 fn distances(graph: &Graph, root: usize, max_depth: usize) -> Vec<usize> {
     let mut adjacent = vec![Vec::new(); graph.nodes.len()];
     for (i, e) in graph.edges.iter().enumerate() {
@@ -837,6 +838,36 @@ fn distances(graph: &Graph, root: usize, max_depth: usize) -> Vec<usize> {
         }
     }
     distance
+}
+/// Walk each direction separately: A <- root -> B must not expand through B's callers.
+fn directed_distances(graph: &Graph, root: usize, incoming: bool) -> Vec<usize> {
+    let mut adjacent = vec![Vec::new(); graph.nodes.len()];
+    for e in &graph.edges {
+        let (from, to) = if incoming {
+            (e.to, e.from)
+        } else {
+            (e.from, e.to)
+        };
+        adjacent[from].push(to);
+    }
+    let mut distance = vec![usize::MAX; graph.nodes.len()];
+    let mut queue = VecDeque::from([root]);
+    distance[root] = 0;
+    while let Some(id) = queue.pop_front() {
+        if distance[id] == 2 {
+            continue;
+        }
+        for next in &adjacent[id] {
+            if distance[*next] == usize::MAX {
+                distance[*next] = distance[id] + 1;
+                queue.push_back(*next);
+            }
+        }
+    }
+    distance
+}
+fn in_scope(e: &Edge, incoming: &[usize], outgoing: &[usize]) -> bool {
+    (incoming[e.to] < 2 && incoming[e.from] <= 2) || (outgoing[e.from] < 2 && outgoing[e.to] <= 2)
 }
 pub fn data(conn: &Connection, args: &Value) -> Result<Value, String> {
     let start = std::time::Instant::now();
@@ -866,12 +897,17 @@ pub fn data(conn: &Connection, args: &Value) -> Result<Value, String> {
         .keys
         .get(&requested)
         .ok_or("узел не найден в индексе связей")?;
-    let max_depth = args["max_depth"].as_u64().unwrap_or(5).clamp(1, 5) as usize;
-    let distance = distances(&graph, root, max_depth);
-    let limited = graph
-        .edges
+    let incoming = directed_distances(&graph, root, true);
+    let outgoing = directed_distances(&graph, root, false);
+    let distance: Vec<_> = incoming
         .iter()
-        .any(|e| (distance[e.from] == usize::MAX) != (distance[e.to] == usize::MAX));
+        .zip(&outgoing)
+        .map(|(a, b)| (*a).min(*b))
+        .collect();
+    let limited = graph.edges.iter().any(|e| {
+        (distance[e.from] != usize::MAX || distance[e.to] != usize::MAX)
+            && !in_scope(e, &incoming, &outgoing)
+    });
     let mut remap = vec![usize::MAX; graph.nodes.len()];
     let mut selected = Vec::new();
     for (i, d) in distance.iter().enumerate() {
@@ -894,7 +930,9 @@ pub fn data(conn: &Connection, args: &Value) -> Result<Value, String> {
                 n.owner
                     .and_then(|o| (remap[o] != usize::MAX).then_some(remap[o])),
                 n.field,
-                distance[*i]
+                distance[*i],
+                (incoming[*i] != usize::MAX).then_some(incoming[*i]),
+                (outgoing[*i] != usize::MAX).then_some(outgoing[*i])
             ])
         })
         .collect();
@@ -902,7 +940,7 @@ pub fn data(conn: &Connection, args: &Value) -> Result<Value, String> {
     let edges: Vec<Value> = graph
         .edges
         .iter()
-        .filter(|e| remap[e.from] != usize::MAX && remap[e.to] != usize::MAX)
+        .filter(|e| in_scope(e, &incoming, &outgoing))
         .map(|e| {
             occurrences += e.count;
             json!([remap[e.from], remap[e.to], e.kind, e.file, e.line, e.count])
@@ -910,13 +948,46 @@ pub fn data(conn: &Connection, args: &Value) -> Result<Value, String> {
         .collect();
     let unresolved:i64=conn.query_row("SELECT count(*) FROM calls WHERE callee_key IS NULL AND resolution NOT IN ('platform_var','platform_global')",[],|r|r.get(0)).unwrap_or(0);
     Ok(
-        json!({"root":remap[root],"nodes":nodes,"edges":edges,"files":graph.files,"kinds":graph.kinds,"node_columns":["key","kind","name","category","file","line","owner","field","distance"],"edge_columns":["from","to","kind","file","line","occurrences"],"complete_in_index":!limited,"complete_in_scope":true,"max_depth":max_depth,"limited_by_depth":limited,"truncated":limited,"occurrences":occurrences,"index_nodes":graph.nodes.len(),"index_edges":graph.edges.len(),"unresolved_calls_in_index":unresolved,"warnings":graph.warnings,"elapsed_ms":start.elapsed().as_millis(),"note":"Связи индекса в обоих направлениях не далее max_depth переходов от корня (максимум 5). Циклы обходятся один раз. Неразрешённые вызовы не считаются доказанными связями. false в роли не означает глобальный запрет."}),
+        json!({"root":remap[root],"nodes":nodes,"edges":edges,"files":graph.files,"kinds":graph.kinds,"node_columns":["key","kind","name","category","file","line","owner","field","distance","incoming_distance","outgoing_distance"],"edge_columns":["from","to","kind","file","line","occurrences"],"complete_in_index":!limited,"complete_in_scope":true,"max_depth":2,"incoming_depth":2,"outgoing_depth":2,"scope":"directed_2_before_2_after","limited_by_depth":limited,"truncated":limited,"occurrences":occurrences,"index_nodes":graph.nodes.len(),"index_edges":graph.edges.len(),"unresolved_calls_in_index":unresolved,"warnings":graph.warnings,"elapsed_ms":start.elapsed().as_millis(),"note":"До двух входящих переходов перед текущим узлом и двух исходящих после него. Направление внутри цепочки не меняется. Циклы обходятся один раз. Неразрешённые вызовы не считаются доказанными связями. false в роли не означает глобальный запрет."}),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn два_до_и_два_после_без_смены_направления() {
+        let mut g = Graph::default();
+        let nodes: Vec<_> = ["L3", "L2", "L1", "Root", "R1", "R2", "R3", "Z", "W"]
+            .iter()
+            .map(|name| g.object("Catalogs", name))
+            .collect();
+        let k = g.kind("r", "Связь", "metadata");
+        for pair in nodes[..7].windows(2) {
+            g.edge(pair[0], pair[1], k, "", 0);
+        }
+        g.edge(nodes[7], nodes[4], k, "", 0); // Root -> R1 <- Z: exclude Z.
+        g.edge(nodes[2], nodes[8], k, "", 0); // Root <- L1 -> W: exclude W.
+        let incoming = directed_distances(&g, nodes[3], true);
+        let outgoing = directed_distances(&g, nodes[3], false);
+        assert_eq!(incoming[nodes[1]], 2);
+        assert_eq!(outgoing[nodes[5]], 2);
+        for id in [nodes[0], nodes[6], nodes[7], nodes[8]] {
+            assert_eq!(incoming[id], usize::MAX);
+            assert_eq!(outgoing[id], usize::MAX);
+        }
+        assert_eq!(
+            g.edges
+                .iter()
+                .filter(|e| in_scope(e, &incoming, &outgoing))
+                .count(),
+            4
+        );
+        g.edge(nodes[4], nodes[3], k, "", 0); // Same node may be on both sides.
+        let incoming = directed_distances(&g, nodes[3], true);
+        assert_eq!(incoming[nodes[4]], 1);
+        assert_eq!(incoming[nodes[7]], 2);
+    }
     #[test]
     fn пятый_уровень_включён_шестой_не_раскрывается() {
         let mut g = Graph::default();
