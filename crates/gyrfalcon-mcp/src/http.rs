@@ -100,7 +100,12 @@ fn маршрут(путь: &str, conn: &Connection) -> (&'static str, Vec<u8>) 
     };
 
     match адрес {
-        "/" | "/index.html" => ("text/html; charset=utf-8", ui::PAGE.as_bytes().to_vec()),
+        "/" | "/index.html" => (
+            "text/html; charset=utf-8",
+            include_bytes!("explorer.html").to_vec(),
+        ),
+        "/map" => ("text/html; charset=utf-8", ui::PAGE.as_bytes().to_vec()),
+        "/api/explore" => json(explore(conn, запрос)),
         "/api/summary" => json(ui::summary_data(conn)),
         "/api/movements" => json(ui::movements_data(conn, limit)),
         "/api/subsystems" => json(ui::subsystems_data(conn, limit)),
@@ -112,9 +117,66 @@ fn маршрут(путь: &str, conn: &Connection) -> (&'static str, Vec<u8>) 
     }
 }
 
+/// Только четыре операции чтения; SQL и изменения через браузер недоступны.
+fn explore(conn: &Connection, query: &str) -> Result<serde_json::Value, String> {
+    let mut tool = String::new();
+    let mut args = serde_json::json!({});
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key == "tool" {
+            tool = decode_component(value)?;
+        }
+        if key == "args" {
+            args = serde_json::from_str(&decode_component(value)?).map_err(|e| e.to_string())?;
+        }
+    }
+    if !["find", "object", "callers", "read"].contains(&tool.as_str()) {
+        return Err("доступны find, object, callers, read".into());
+    }
+    crate::tools::call(conn, crate::tools::Profile::Analysis, &tool, &args)
+}
+
+fn decode_component(value: &str) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    let mut chars = value.bytes();
+    while let Some(c) = chars.next() {
+        match c {
+            b'+' => bytes.push(b' '),
+            b'%' => {
+                let a = chars.next().and_then(|c| (c as char).to_digit(16));
+                let b = chars.next().and_then(|c| (c as char).to_digit(16));
+                bytes.push(
+                    (a.ok_or("неверное URL-кодирование")? * 16
+                        + b.ok_or("неверное URL-кодирование")?) as u8,
+                );
+            }
+            _ => bytes.push(c),
+        }
+    }
+    String::from_utf8(bytes).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explorer_декодирует_utf8_и_отклоняет_изменения() {
+        assert_eq!(
+            decode_component("%D0%A2%D0%B5%D1%81%D1%82+1").unwrap(),
+            "Тест 1"
+        );
+        assert!(decode_component("%ZZ").is_err());
+        assert!(decode_component("%D0").is_err());
+        assert!(explore(&база(), "tool=sql&args=%7B%7D")
+            .unwrap_err()
+            .contains("доступны"));
+        assert!(explore(&база(), "tool=delete_project").is_err());
+        let (_, page) = маршрут("/", &база());
+        assert!(String::from_utf8(page)
+            .unwrap()
+            .contains("Найти и разобраться"));
+    }
 
     fn база() -> Connection {
         let c = Connection::open_in_memory().unwrap();
