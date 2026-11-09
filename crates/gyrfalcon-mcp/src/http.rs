@@ -117,6 +117,7 @@ fn маршрут(путь: &str, conn: &Connection) -> (&'static str, Vec<u8>) 
         ),
         "/map" => ("text/html; charset=utf-8", ui::PAGE.as_bytes().to_vec()),
         "/api/explore" => json(explore(conn, запрос)),
+        "/api/graph" => json(graph(conn, запрос)),
         "/api/metadata" => json(metadata(conn, запрос)),
         "/api/summary" => json(ui::summary_data(conn)),
         "/api/movements" => json(ui::movements_data(conn, limit)),
@@ -127,6 +128,18 @@ fn маршрут(путь: &str, conn: &Connection) -> (&'static str, Vec<u8>) 
             format!("нет такого адреса: {адрес}").into_bytes(),
         ),
     }
+}
+
+fn graph(conn: &Connection, query: &str) -> Result<serde_json::Value, String> {
+    let args = query
+        .split('&')
+        .find_map(|p| p.strip_prefix("args="))
+        .ok_or("нужны параметры узла")?;
+    let args = serde_json::from_str(&decode_component(args)?).map_err(|e| e.to_string())?;
+    let snapshot = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let result = crate::connection_graph::data(&snapshot, &args)?;
+    snapshot.commit().map_err(|e| e.to_string())?;
+    Ok(result)
 }
 
 fn metadata(conn: &Connection, query: &str) -> Result<serde_json::Value, String> {

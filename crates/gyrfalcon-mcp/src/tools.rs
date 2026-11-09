@@ -1004,7 +1004,9 @@ fn find(conn: &Connection, args: &Value) -> Result<Value, String> {
 /// пустым) плюс владельцы модулей: на типовой УТ четыре общих модуля есть
 /// кодом, а XML описания у них в выгрузке нет. Сверено на `ut-index`:
 /// реквизиты и движения ссылаются только на объекты из этого реестра.
-fn реестр_объектов(conn: &Connection) -> Result<Vec<(String, String)>, String> {
+pub(crate) fn реестр_объектов(
+    conn: &Connection,
+) -> Result<Vec<(String, String)>, String> {
     let mut query="SELECT object_name,category FROM object_synonyms UNION SELECT object_name,COALESCE(category,'') FROM modules WHERE object_name IS NOT NULL AND COALESCE(category,'')<>'Ext'".to_string();
     for (table, name, category) in [
         ("event_subscriptions", "name", "EventSubscriptions"),

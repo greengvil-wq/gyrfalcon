@@ -10,6 +10,7 @@ pub mod autoupdate;
 pub mod changes;
 pub mod check_bsl;
 pub mod check_scope;
+pub mod connection_graph;
 pub mod freshness_guard;
 pub mod grep;
 pub mod hooks;
