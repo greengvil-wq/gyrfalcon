@@ -159,6 +159,11 @@ fn key_of(rel_path: &str, method: &str) -> String {
 ///
 /// `caller_module` — путь модуля, откуда идёт вызов: нужен для локальных имён.
 pub fn resolve(name: &str, caller_module: &str, t: &ResolveTables) -> ResolvedCall {
+    if let Some(target) = name.strip_prefix("$notification$") {
+        let mut result = resolve(target, caller_module, t);
+        result.callee_name = name.to_string();
+        return result;
+    }
     let low = name.to_lowercase();
 
     let Some((head, tail)) = low.split_once('.') else {

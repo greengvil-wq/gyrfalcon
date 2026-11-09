@@ -167,6 +167,11 @@ pub fn parse_tree(tree: &tree_sitter::Tree, source: &str) -> ParsedModule {
             "assignment_statement" | "var_statement" | "for_each_statement" => {
                 collect_local(node, bytes, &mut out.locals);
             }
+            "new_expression" => {
+                if let Some(c) = notification_of(node, bytes) {
+                    out.calls.push(c);
+                }
+            }
             "method_call" => {
                 if let Some(c) = call_of(node, bytes) {
                     out.calls.push(c);
@@ -305,22 +310,53 @@ fn call_of(node: Node, bytes: &[u8]) -> Option<Call> {
 
     // Родитель `call_expression` означает квалифицированный вызов:
     // его первый именованный потомок — `access` с текстом квалификатора.
+    // Квалификатор берём до ТЕКУЩЕГО вызова: у цепочки первый вызов
+    // может лежать внутри access, а не непосредственно в call_expression.
     let full = node
         .parent()
-        .filter(|p| p.kind() == "call_expression")
-        .and_then(|p| p.child(0))
-        .filter(|a| a.kind() == "access")
-        .and_then(|a| a.utf8_text(bytes).ok())
-        .map_or_else(
-            || name.to_string(),
-            |qual| format!("{}.{}", qual.trim(), name),
-        );
+        .filter(|p| matches!(p.kind(), "call_expression" | "access"))
+        .and_then(|p| bytes.get(p.start_byte()..node.start_byte()))
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .map(|prefix| prefix.trim().trim_end_matches('.').trim())
+        .filter(|prefix| !prefix.is_empty())
+        .map_or_else(|| name.to_string(), |prefix| format!("{prefix}.{name}"));
 
     Some(Call {
         name: full,
         line,
         caller: None,
         arg_count: count_args(node, bytes),
+    })
+}
+
+/// Литеральное оповещение на текущий модуль. Иной получатель без вывода
+/// типов не разрешается; строковые выражения также не считаются именем.
+fn notification_of(node: Node, bytes: &[u8]) -> Option<Call> {
+    let typ = node
+        .child_by_field_name("type")?
+        .utf8_text(bytes)
+        .ok()?
+        .to_lowercase();
+    if !matches!(typ.as_str(), "описаниеоповещения" | "notifydescription") {
+        return None;
+    }
+    let args = node.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    let values: Vec<_> = args.named_children(&mut cursor).collect();
+    let target = values.first()?.utf8_text(bytes).ok()?.trim();
+    let receiver = values.get(1)?.utf8_text(bytes).ok()?.trim().to_lowercase();
+    if !matches!(receiver.as_str(), "этотобъект" | "thisobject") {
+        return None;
+    }
+    let target = target.strip_prefix('"')?.strip_suffix('"')?;
+    if target.is_empty() || !target.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some(Call {
+        name: format!("$notification${target}"),
+        line: node.start_position().row as u32 + 1,
+        caller: None,
+        arg_count: 0,
     })
 }
 
@@ -518,6 +554,29 @@ fn header_comment(source: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn цепочка_сохраняет_первый_локальный_вызов() {
+        let m = parse("Процедура П()\n Локальная().Вставить(1);\nКонецПроцедуры\nФункция Локальная()\nКонецФункции").unwrap();
+        assert!(
+            m.calls.iter().any(|c| c.name == "Локальная"),
+            "{:?}",
+            m.calls
+        );
+        assert!(!m.calls.iter().any(|c| c.name == "Вставить"));
+    }
+    #[test]
+    fn оповещение_с_литералом_только_на_текущий_модуль() {
+        let m = parse("Процедура П()\n А = Новый ОписаниеОповещения(\n \"Готово\", ЭтотОбъект);\n Б = Новый ОписаниеОповещения(\"Чужой\", Получатель);\n В = Новый ОписаниеОповещения(Имя, ЭтотОбъект);\nКонецПроцедуры\nПроцедура Готово()\nКонецПроцедуры").unwrap();
+        let calls: Vec<_> = m
+            .calls
+            .iter()
+            .filter(|c| c.name.starts_with("$notification$"))
+            .collect();
+        assert_eq!(calls.len(), 1, "{:?}", m.calls);
+        assert_eq!(calls[0].name, "$notification$Готово");
+        assert_eq!(calls[0].caller, Some(0));
+    }
 
     const МОДУЛЬ: &str = "// Шапка модуля.\n\
 // Вторая строка.\n\

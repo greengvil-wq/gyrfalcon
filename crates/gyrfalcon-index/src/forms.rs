@@ -58,6 +58,8 @@ pub struct FormElement {
     pub handler: String,
     pub data_path: String,
     pub main_table: String,
+    /// Привязка элемента формы к команде (CommandName).
+    pub command_name: String,
     pub attribute_is_main: bool,
     pub file: String,
 }
@@ -156,6 +158,7 @@ pub fn parse_form(
     // путь самой таблицы терялся. Стек здесь ровно тот же, что у `элемент`,
     // и растёт-убывает вместе с ним.
     let mut пути: Vec<Option<String>> = Vec::new();
+    let mut command_names: Vec<String> = Vec::new();
     // Глубина `Type` внутри реквизита: тип берётся только у самого реквизита,
     // а не у вложенных квалификаторов.
     let mut в_типе = false;
@@ -176,7 +179,20 @@ pub fn parse_form(
             // ни текста, ни парного `End`. Открывать по нему область нельзя —
             // стек разъедется на первом же элементе. В выгрузке форм таких
             // тегов много: 448 против 3 271 открывающих на одной форме.
-            Ok(XmlEvent::Empty(_)) => {}
+            Ok(XmlEvent::Empty(e)) => {
+                if stack.iter().any(|t| t == "ChildItems") {
+                    if let Some(name) = attr(&e, "name") {
+                        let kind = local_name(e.name().as_ref());
+                        if !СЛУЖЕБНЫЕ.contains(&kind.as_str()) {
+                            let mut row = образец.clone();
+                            row.kind = "element";
+                            row.element_name = name;
+                            row.element_type = kind;
+                            out.push(row);
+                        }
+                    }
+                }
+            }
 
             Ok(XmlEvent::Start(e)) => {
                 let имя = local_name(e.name().as_ref());
@@ -217,6 +233,7 @@ pub fn parse_form(
                                 элемент.push((String::new(), имя.clone()));
                             }
                             пути.push(None);
+                            command_names.push(String::new());
                         }
                     }
                     _ => {}
@@ -251,6 +268,11 @@ pub fn parse_form(
                     "MainAttribute" => {
                         if let Some(r) = текущий_реквизит.as_mut() {
                             r.attribute_is_main = s == "true";
+                        }
+                    }
+                    "CommandName" => {
+                        if let Some(value) = command_names.last_mut() {
+                            *value = s;
                         }
                     }
                     "Action" => {
@@ -343,8 +365,24 @@ pub fn parse_form(
                             && !элемент.is_empty()
                             && элемент.last().map(|(_, в)| в.as_str()) == Some(имя.as_str())
                         {
-                            элемент.pop();
-                            пути.pop();
+                            let (name, kind) = элемент.pop().unwrap();
+                            let path = пути.pop().flatten().unwrap_or_default();
+                            let command = command_names.pop().unwrap_or_default();
+                            if !name.is_empty() {
+                                let mut row = образец.clone();
+                                row.kind = "element";
+                                row.element_name = name.clone();
+                                row.element_type = kind;
+                                row.data_path = path.clone();
+                                row.command_name = command;
+                                for handler in out
+                                    .iter_mut()
+                                    .filter(|r| r.kind == "handler" && r.element_name == name)
+                                {
+                                    handler.data_path.clone_from(&path);
+                                }
+                                out.push(row);
+                            }
                         }
                     }
                 }
@@ -379,6 +417,21 @@ mod tests {
     fn разобрать(имя: &str, xml: &str) -> Vec<FormElement> {
         let p = во_временный(имя, xml);
         parse_form(&p, "Тест", "Documents", "ФормаДокумента", "x")
+    }
+
+    #[test]
+    fn элемент_без_событий_и_кнопка_с_командой() {
+        let rows = разобрать(
+            "элементы.xml",
+            r#"<Form><ChildItems><InputField name="Код"><DataPath>Объект.Код</DataPath></InputField><Button name="Пуск"><CommandName>Form.Command.Пуск</CommandName></Button><LabelField name="Метка"/></ChildItems></Form>"#,
+        );
+        assert_eq!(rows.len(), 3);
+        assert!(rows
+            .iter()
+            .any(|r| r.element_name == "Код" && r.data_path == "Объект.Код"));
+        assert!(rows
+            .iter()
+            .any(|r| r.element_name == "Пуск" && r.command_name == "Form.Command.Пуск"));
     }
 
     const ФОРМА: &str = r#"<?xml version="1.0" encoding="UTF-8"?>

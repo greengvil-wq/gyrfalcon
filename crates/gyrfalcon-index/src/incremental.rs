@@ -318,14 +318,15 @@ pub fn update(db: &Path, src: &Path, files: &[std::path::PathBuf]) -> Result<Inc
                 let caller_id = первый_метод + caller as i64;
                 let r = resolve::resolve(&c.name, &d.rel_path, &tables);
                 tx.execute(
-                    "INSERT INTO calls (caller_id, callee_name, callee_key, resolution, confidence)
-                     VALUES (?1,?2,?3,?4,?5)",
+                    "INSERT INTO calls (caller_id, callee_name, callee_key, resolution, confidence, line)
+                     VALUES (?1,?2,?3,?4,?5,?6)",
                     rusqlite::params![
                         caller_id,
                         r.callee_name,
                         r.callee_key,
                         r.resolution.as_str(),
-                        r.confidence
+                        r.confidence,
+                        c.line
                     ],
                 )?;
                 report.calls += 1;

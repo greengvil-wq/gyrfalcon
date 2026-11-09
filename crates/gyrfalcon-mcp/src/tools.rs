@@ -152,7 +152,8 @@ pub const TOOLS: &[Tool] = &[
              от «разрешать нечего». Заменяет поиск по тексту при анализе влияния правки. \
              Обход — по конкретному методу (module сужает), а не по имени: одноимённые \
              методы других модулей не подмешиваются; несвязанные вызовы того же имени — \
-             отдельно, в unresolved_same_name. Метода нет — found: false и places.",
+             отдельно, в unresolved_same_name. Продолжение страницы: has_more и next_offset; \
+             повторите запрос с offset=next_offset. Метода нет — found: false и places.",
         schema: schema_callers,
     },
     Tool {
@@ -322,9 +323,11 @@ fn schema_object() -> Value {
             "name": {"type": "string", "description": "Имя объекта, например ЗаказКлиента"},
             "category": {"type": "string", "description":
                 "Категория (Catalogs/Documents/…), если имя неоднозначно"},
+            "limit": {"type":"integer", "default":100, "minimum":1, "maximum":2000},
+            "offset": {"type":"integer", "default":0, "minimum":0, "description":"Начало страницы каждого раздела связей"},
             "parts": {"type": "array", "items": {"type": "string"}, "description":
                 "Что включить: attributes, synonyms, predefined, enum_values, movements, based_on, basis_for, forms, rights, options, subscriptions, scheduled_jobs. \
-                 По умолчанию — всё, кроме forms (их бывает много)"}
+                 Также modules, metadata_in, metadata_out, code_usages, form_details, form_references, subsystems, defined_types, characteristic_types. По умолчанию — все разделы; новые разделы постраничные"}
         }),
         &["name"],
     )
@@ -354,7 +357,8 @@ fn schema_callers() -> Value {
                 "description": "in — кто вызывает; out — кого вызывает"},
             "depth": {"type": "integer", "default": 2, "description":
                 "Глубина обхода. 1 — прямые связи"},
-            "limit": {"type": "integer", "default": 100}
+            "limit": {"type": "integer", "default": 100, "minimum": 1, "maximum": 2000},
+            "offset": {"type": "integer", "default": 0, "minimum": 0, "description": "Начало страницы; следующий offset возвращается в next_offset"}
         }),
         &["method"],
     )
@@ -1507,6 +1511,16 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
                 "options",
                 "subscriptions",
                 "scheduled_jobs",
+                "forms",
+                "modules",
+                "metadata_in",
+                "metadata_out",
+                "code_usages",
+                "form_details",
+                "form_references",
+                "subsystems",
+                "defined_types",
+                "characteristic_types",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -1733,6 +1747,28 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
             &[&name],
         )?;
     }
+    let limit = число(args, "limit").unwrap_or(100).clamp(1, 2000) as usize;
+    let offset = число(args, "offset").unwrap_or(0);
+    if offset < 0 {
+        return Err("offset должен быть неотрицательным".into());
+    }
+    let offset = usize::try_from(offset).map_err(|_| "слишком большой offset")?;
+    for part in [
+        "modules",
+        "metadata_in",
+        "metadata_out",
+        "code_usages",
+        "form_details",
+        "form_references",
+        "subsystems",
+        "defined_types",
+        "characteristic_types",
+    ] {
+        if есть(part) {
+            out[part] = object_relation(conn, part, &name, кат.as_deref(), &полные, limit, offset)?;
+        }
+    }
+    out["coverage_note"] = json!("Связи из статического индекса; отсутствие строк не гарантирует отсутствие динамических обращений. Для старого индекса недоступные таблицы отмечены явно.");
     // Пустой раздел существующего объекта — факт о конфигурации, и он
     // назван, чтобы не путаться с «объекта нет» (тот ответ — выше, без карточки).
     let пустые: Vec<&str> = parts
@@ -1744,6 +1780,75 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
         out["empty_parts"] = json!(пустые);
     }
     Ok(out)
+}
+
+/// Общая карточка: точные типизированные связи и адреса источников.
+fn object_relation(
+    conn: &Connection,
+    part: &str,
+    name: &str,
+    category: Option<&str>,
+    full: &[String],
+    limit: usize,
+    offset: usize,
+) -> Result<Value, String> {
+    let (table, sql) = match part {
+        "modules" => ("modules", "SELECT rel_path, category, form_name FROM modules WHERE object_name=?1 COLLATE NOCASE AND (?2 IS NULL OR category=?2) ORDER BY rel_path"),
+        "metadata_out" => ("metadata_references", "SELECT ref_kind, ref_object, used_in, path, line, source_category FROM metadata_references WHERE source_object=?1 COLLATE NOCASE AND (?2 IS NULL OR source_category=?2) ORDER BY path, line, id"),
+        "metadata_in" => ("metadata_references", "SELECT ref_kind, source_category, source_object, used_in, path, line FROM metadata_references WHERE ref_object IN (SELECT value FROM json_each(?3)) ORDER BY path, line, id"),
+        "code_usages" => ("metadata_code_usages", "SELECT u.usage_kind, u.object_ref, u.member_path, m.rel_path, u.line FROM metadata_code_usages u JOIN modules m ON m.id=u.module_id WHERE u.object_ref_key IN (SELECT value FROM json_each(?4)) ORDER BY m.rel_path, u.line, u.id"),
+        "form_details" => ("form_elements", "SELECT f.category, f.form_name, f.kind, f.scope, f.element_name, f.element_type, f.event, f.handler, f.data_path, json_extract(NULLIF(f.extra_json, ''), '$.command_name') AS command_name, f.attribute_is_main, f.file, mo.rel_path AS handler_module, me.line AS handler_line FROM form_elements f LEFT JOIN modules mo ON mo.rel_path=replace(f.file, '/Form.xml', '/Form/Module.bsl') LEFT JOIN methods me ON me.module_id=mo.id AND me.name=f.handler COLLATE NOCASE WHERE f.object_name=?1 COLLATE NOCASE AND (?2 IS NULL OR f.category=?2) ORDER BY f.file, f.id"),
+        "form_references" => ("form_elements", "SELECT f.category, f.object_name, f.form_name, f.kind, f.element_name, f.element_type, f.file FROM form_elements f WHERE EXISTS (SELECT 1 FROM json_each(?5) t WHERE instr(', ' || f.element_type || ', ', ', ' || t.value || ', ')>0) ORDER BY f.file, f.id"),
+        "subsystems" => ("subsystem_content", "SELECT subsystem_name, object_ref, file FROM subsystem_content WHERE object_ref IN (SELECT value FROM json_each(?3)) ORDER BY file, id"),
+        "defined_types" => ("defined_types", "SELECT name, type_refs_json, path FROM defined_types WHERE EXISTS (SELECT 1 FROM json_each(type_refs_json) t WHERE t.value IN (SELECT value FROM json_each(?5))) ORDER BY path, id"),
+        "characteristic_types" => ("characteristic_types", "SELECT pvh_name, type_refs_json, path FROM characteristic_types WHERE EXISTS (SELECT 1 FROM json_each(type_refs_json) t WHERE t.value IN (SELECT value FROM json_each(?5))) ORDER BY path, id"),
+        _ => return Err(format!("неизвестный раздел {part}")),
+    };
+    if !есть_таблица(conn, table) {
+        return Ok(нет_таблицы(table));
+    }
+    let refs = json!(full).to_string();
+    let keys = json!(full.iter().map(|s| s.to_lowercase()).collect::<Vec<_>>()).to_string();
+    let types: Vec<String> = full
+        .iter()
+        .flat_map(|s| {
+            let (kind, object) = s.split_once('.').unwrap_or(("", ""));
+            [
+                format!("{kind}Ref.{object}"),
+                format!("cfg:{kind}Ref.{object}"),
+                format!("cfg:{kind}Object.{object}"),
+                format!("cfg:{kind}RecordSet.{object}"),
+                s.clone(),
+            ]
+        })
+        .collect();
+    let types = json!(types).to_string();
+    // SQLite нумерует пропущенные параметры до наибольшего номера.
+    let params: [&dyn rusqlite::ToSql; 5] = [&name, &category, &refs, &keys, &types];
+    let page_sql = format!("{sql} LIMIT {} OFFSET {offset}", limit + 1);
+    let count = conn
+        .prepare(&page_sql)
+        .map_err(|e| e.to_string())?
+        .parameter_count();
+    let mut result = выборка(conn, &page_sql, &params[..count])?;
+    page_result(&mut result, limit, offset);
+    Ok(result)
+}
+
+/// Страница с явным продолжением; запрос обязан получить limit + 1 строку.
+fn page_result(v: &mut Value, limit: usize, offset: usize) {
+    let rows = v["rows"].as_array_mut().expect("табличный ответ");
+    let more = rows.len() > limit;
+    rows.truncate(limit);
+    let count = rows.len();
+    v["count"] = json!(count);
+    v["offset"] = json!(offset);
+    v["has_more"] = json!(more);
+    v["next_offset"] = if more {
+        json!(offset + count)
+    } else {
+        Value::Null
+    };
 }
 
 /// Метод в индексе: id, имя, модуль, строка.
@@ -1780,13 +1885,21 @@ fn callers(conn: &Connection, args: &Value) -> Result<Value, String> {
     let depth = число(args, "depth").unwrap_or(2).clamp(1, 5);
     let limit = число(args, "limit").unwrap_or(100).clamp(1, 2000) as usize;
 
-    let mut out = json!({"method": method, "direction": dir, "depth": depth});
+    let offset = число(args, "offset").unwrap_or(0);
+    if offset < 0 {
+        return Err("offset должен быть неотрицательным".into());
+    }
+    if !["in", "out", "both"].contains(&dir.as_str()) {
+        return Err("direction: in, out или both".into());
+    }
+    let offset = usize::try_from(offset).map_err(|_| "слишком большой offset")?;
+    let mut out = json!({"method": method, "direction": dir, "depth": depth, "offset": offset});
 
     let mut st = conn
         .prepare(
             "SELECT m.id, m.name, mo.rel_path, m.line FROM methods m
              JOIN modules mo ON mo.id = m.module_id
-             WHERE m.name = ?1 COLLATE NOCASE ORDER BY mo.rel_path, m.line",
+             WHERE m.name = ?1 COLLATE NOCASE ORDER BY mo.rel_path, m.line, m.id",
         )
         .map_err(|e| e.to_string())?;
     let все: Vec<МетодВИндексе> = st
@@ -1842,7 +1955,7 @@ fn callers(conn: &Connection, args: &Value) -> Result<Value, String> {
     }
 
     if dir == "in" || dir == "both" {
-        out["callers"] = вызывающие(conn, &корни, depth, limit)?;
+        out["callers"] = вызывающие(conn, &корни, depth, limit, offset)?;
         // Вызовы с тем же именем, не связанные ни с каким методом (объектный
         // вызов через переменную, менеджер без разрешения): индекс не знает,
         // чьи они. Показываются, но в рекурсию не идут — иначе вернулась бы
@@ -1854,9 +1967,10 @@ fn callers(conn: &Connection, args: &Value) -> Result<Value, String> {
              JOIN modules mo ON mo.id = m.module_id
              WHERE c.callee_key IS NULL AND c.callee_name = ?1 COLLATE NOCASE
                AND c.resolution NOT IN ('platform_var', 'platform_global')
-             ORDER BY mo.rel_path, c.line LIMIT ?2",
-            &[&method, &(limit as i64)],
+             ORDER BY mo.rel_path, c.line, c.id LIMIT ?2 OFFSET ?3",
+            &[&method, &((limit + 1) as i64), &(offset as i64)],
         )?;
+        page_result(&mut out["unresolved_same_name"], limit, offset);
         out["unresolved_same_name"]["note"] = json!(
             "вызовы этого имени, которые индекс не связал с конкретным методом: \
              могут быть и вызовами искомого, и чужого; в обход не включены"
@@ -1872,15 +1986,16 @@ fn callers(conn: &Connection, args: &Value) -> Result<Value, String> {
         let v = выборка(
             conn,
             &format!(
-                "SELECT c.callee_name, c.resolution, c.confidence, c.line, mo.rel_path AS via
+                "SELECT c.callee_name, c.resolution, c.confidence, c.line, mo.rel_path AS via, c.callee_key
                  FROM calls c JOIN methods m ON m.id = c.caller_id
                  JOIN modules mo ON mo.id = m.module_id
-                 WHERE c.caller_id IN ({}) ORDER BY mo.rel_path, c.line LIMIT ?1",
+                 WHERE c.caller_id IN ({}) ORDER BY mo.rel_path, c.line, c.id LIMIT ?1 OFFSET ?2",
                 ids.join(",")
             ),
-            &[&(limit as i64)],
+            &[&((limit + 1) as i64), &(offset as i64)],
         )?;
         out["callees"] = v;
+        page_result(&mut out["callees"], limit, offset);
     }
     Ok(out)
 }
@@ -1895,7 +2010,9 @@ fn вызывающие(
     корни: &[&МетодВИндексе],
     depth: i64,
     limit: usize,
+    offset: usize,
 ) -> Result<Value, String> {
+    let mut skipped = 0usize;
     let mut st = conn
         .prepare(
             "SELECT DISTINCT m.id, m.name, mo.rel_path, m.line
@@ -1926,11 +2043,15 @@ fn вызывающие(
                 if !виденные.insert(id) {
                     continue;
                 }
+                следующий.push((ключ_метода(&модуль, &имя), via.clone()));
+                if skipped < offset {
+                    skipped += 1;
+                    continue;
+                }
                 if строки.len() >= limit {
                     обрезано = true;
                     break 'обход;
                 }
-                следующий.push((ключ_метода(&модуль, &имя), via.clone()));
                 строки.push(json!([имя, hop, модуль, строка, via]));
             }
         }
@@ -1944,6 +2065,13 @@ fn вызывающие(
         "count": строки.len(),
         "rows": строки,
     });
+    v["offset"] = json!(offset);
+    v["has_more"] = json!(обрезано);
+    v["next_offset"] = if обрезано {
+        json!(offset + v["count"].as_u64().unwrap_or(0) as usize)
+    } else {
+        Value::Null
+    };
     if обрезано {
         v["truncated"] = json!(true);
         v["note"] = json!("достигнут limit — показаны ближайшие по расстоянию");
@@ -2455,6 +2583,69 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn больше_двух_тысяч_вызывающих_и_связь_обработчика_формы() {
+        let и = ИндексВызовов::новый("large-form");
+        let src = и.0.join("src");
+        let module = src.join("CommonModules/М/Ext/Module.bsl");
+        std::fs::create_dir_all(module.parent().unwrap()).unwrap();
+        let mut code = "Процедура Цель() Экспорт\nКонецПроцедуры\n".to_string();
+        for n in 0..2011 {
+            code.push_str(&format!("Процедура П{n}()\n Цель();\nКонецПроцедуры\n"));
+        }
+        std::fs::write(module, code).unwrap();
+        let form = src.join("Documents/А/Forms/Ф/Ext/Form.xml");
+        std::fs::create_dir_all(form.parent().unwrap().join("Form")).unwrap();
+        std::fs::write(&form, "<Form><Events><Event name=\"OnOpen\">Открыть</Event></Events><ChildItems><InputField name=\"Код\"><DataPath>Объект.Код</DataPath></InputField></ChildItems></Form>").unwrap();
+        std::fs::write(form.parent().unwrap().join("Form/Module.bsl"), "Процедура Открыть()\n Оповещение = Новый ОписаниеОповещения(\"Готово\", ЭтотОбъект);\nКонецПроцедуры\nПроцедура Готово()\nКонецПроцедуры").unwrap();
+        gyrfalcon_index::build(&src, &и.0.join("i.db"), None).unwrap();
+        let first = и.вызвать(json!({"method":"Цель", "depth":1, "limit":2000}));
+        let second =
+            и.вызвать(json!({"method":"Цель", "depth":1, "limit":2000, "offset":2000}));
+        assert_eq!(first["callers"]["count"], 2000);
+        assert_eq!(first["callers"]["next_offset"], 2000);
+        assert_eq!(second["callers"]["count"], 11);
+        assert_eq!(second["callers"]["has_more"], false);
+        let callback = и
+            .вызвать(json!({"method":"Готово", "module":"Documents/А/Forms/Ф/", "depth":1}));
+        assert_eq!(callback["callers"]["count"], 1);
+        let c = Connection::open(и.0.join("i.db")).unwrap();
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM calls WHERE line IS NULL", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+        let card = object(&c, &json!({"name":"А", "parts":["form_details"]})).unwrap();
+        let rows = card["form_details"]["rows"].as_array().unwrap();
+        assert!(
+            rows.iter().any(|r| r[7] == "Открыть" && r[13] == 1),
+            "{card:#}"
+        );
+        assert!(rows.iter().any(|r| r[8] == "Объект.Код"));
+    }
+
+    #[test]
+    fn страницы_графа_без_повторов_и_потерь() {
+        let и = ИндексВызовов::новый("pages");
+        let full = и.вызвать(
+            json!({"method":"ЗаполнитьПоЗаказуКлиента", "module":"Documents/А/", "depth":3}),
+        );
+        let first = и.вызвать(json!({"method":"ЗаполнитьПоЗаказуКлиента", "module":"Documents/А/", "depth":3, "limit":1}));
+        let second = и.вызвать(json!({"method":"ЗаполнитьПоЗаказуКлиента", "module":"Documents/А/", "depth":3, "limit":1, "offset":1}));
+        assert_eq!(first["callers"]["next_offset"], 1);
+        assert_eq!(second["callers"]["has_more"], false);
+        assert_eq!(first["callers"]["rows"][0], full["callers"]["rows"][0]);
+        assert_eq!(second["callers"]["rows"][0], full["callers"]["rows"][1]);
+        let c = Connection::open(и.0.join("i.db")).unwrap();
+        let card = object(&c, &json!({"name":"А"})).unwrap();
+        assert_eq!(card["found"], true);
+        assert_eq!(card["modules"]["count"], 1);
+        assert!(card["form_details"].get("rows").is_some());
     }
 
     /// `module` учитывается, а второй шаг идёт по методу, а не по имени:
