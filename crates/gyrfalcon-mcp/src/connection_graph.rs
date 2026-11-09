@@ -1,4 +1,4 @@
-//! Полная компонента связности индекса без ограничения числа узлов или рёбер.
+//! Карта связей до пяти переходов от корня без ограничения числа соседей.
 //! Строки источников агрегируются по паре узлов и виду связи; число вхождений
 //! сохраняется. Неразрешённые вызовы не превращаются в выдуманные зависимости.
 use rusqlite::Connection;
@@ -814,7 +814,7 @@ fn build(conn: &Connection) -> Result<Graph, String> {
     Ok(g)
 }
 
-fn distances(graph: &Graph, root: usize) -> Vec<usize> {
+fn distances(graph: &Graph, root: usize, max_depth: usize) -> Vec<usize> {
     let mut adjacent = vec![Vec::new(); graph.nodes.len()];
     for (i, e) in graph.edges.iter().enumerate() {
         adjacent[e.from].push(i);
@@ -824,6 +824,9 @@ fn distances(graph: &Graph, root: usize) -> Vec<usize> {
     let mut queue = VecDeque::from([root]);
     distance[root] = 0;
     while let Some(id) = queue.pop_front() {
+        if distance[id] >= max_depth {
+            continue;
+        }
         for e in &adjacent[id] {
             let e = &graph.edges[*e];
             let next = if e.from == id { e.to } else { e.from };
@@ -863,7 +866,12 @@ pub fn data(conn: &Connection, args: &Value) -> Result<Value, String> {
         .keys
         .get(&requested)
         .ok_or("узел не найден в индексе связей")?;
-    let distance = distances(&graph, root);
+    let max_depth = args["max_depth"].as_u64().unwrap_or(5).clamp(1, 5) as usize;
+    let distance = distances(&graph, root, max_depth);
+    let limited = graph
+        .edges
+        .iter()
+        .any(|e| (distance[e.from] == usize::MAX) != (distance[e.to] == usize::MAX));
     let mut remap = vec![usize::MAX; graph.nodes.len()];
     let mut selected = Vec::new();
     for (i, d) in distance.iter().enumerate() {
@@ -902,13 +910,32 @@ pub fn data(conn: &Connection, args: &Value) -> Result<Value, String> {
         .collect();
     let unresolved:i64=conn.query_row("SELECT count(*) FROM calls WHERE callee_key IS NULL AND resolution NOT IN ('platform_var','platform_global')",[],|r|r.get(0)).unwrap_or(0);
     Ok(
-        json!({"root":remap[root],"nodes":nodes,"edges":edges,"files":graph.files,"kinds":graph.kinds,"node_columns":["key","kind","name","category","file","line","owner","field","distance"],"edge_columns":["from","to","kind","file","line","occurrences"],"complete_in_index":true,"truncated":false,"occurrences":occurrences,"index_nodes":graph.nodes.len(),"index_edges":graph.edges.len(),"unresolved_calls_in_index":unresolved,"warnings":graph.warnings,"elapsed_ms":start.elapsed().as_millis(),"note":"Вся достижимая компонента связей индекса в обоих направлениях. Циклы обходятся один раз. Неразрешённые вызовы не считаются доказанными связями. false в роли не означает глобальный запрет."}),
+        json!({"root":remap[root],"nodes":nodes,"edges":edges,"files":graph.files,"kinds":graph.kinds,"node_columns":["key","kind","name","category","file","line","owner","field","distance"],"edge_columns":["from","to","kind","file","line","occurrences"],"complete_in_index":!limited,"complete_in_scope":true,"max_depth":max_depth,"limited_by_depth":limited,"truncated":limited,"occurrences":occurrences,"index_nodes":graph.nodes.len(),"index_edges":graph.edges.len(),"unresolved_calls_in_index":unresolved,"warnings":graph.warnings,"elapsed_ms":start.elapsed().as_millis(),"note":"Связи индекса в обоих направлениях не далее max_depth переходов от корня (максимум 5). Циклы обходятся один раз. Неразрешённые вызовы не считаются доказанными связями. false в роли не означает глобальный запрет."}),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn пятый_уровень_включён_шестой_не_раскрывается() {
+        let mut g = Graph::default();
+        let root = g.object("Catalogs", "Корень");
+        let k = g.kind("r", "Связь", "metadata");
+        let mut last = root;
+        let mut chain = vec![root];
+        for i in 1..=7 {
+            let next = g.object("Catalogs", &format!("Уровень{i}"));
+            g.edge(last, next, k, "", 0);
+            chain.push(next);
+            last = next;
+        }
+        let found = distances(&g, root, 5);
+        assert_eq!(found[chain[5]], 5);
+        assert_eq!(found[chain[6]], usize::MAX);
+        assert_eq!(found[chain[7]], usize::MAX);
+        assert_eq!(found.iter().filter(|d| **d != usize::MAX).count(), 6);
+    }
     #[test]
     fn адреса_полей_форм_и_вложенных_подсистем_не_смешиваются() {
         let mut g = Graph::default();
@@ -943,7 +970,7 @@ mod tests {
             let caller = g.object("CommonModules", &format!("Модуль{i}"));
             g.edge(caller, root, k, "", 1);
         }
-        let found = distances(&g, root);
+        let found = distances(&g, root, usize::MAX);
         assert_eq!(found.len(), 3822);
         assert_eq!(found.iter().filter(|d| **d == 1).count(), 3821);
     }
@@ -966,7 +993,7 @@ mod tests {
         }
         g.edge(last, a, k, "x", 0);
         let isolated = g.object("Catalogs", "Изолированный");
-        let found = distances(&g, a);
+        let found = distances(&g, a, usize::MAX);
         assert_eq!(found.iter().filter(|n| **n != usize::MAX).count(), 2503);
         assert_eq!(found[isolated], usize::MAX);
     }
