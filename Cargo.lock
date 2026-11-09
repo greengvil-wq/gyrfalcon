@@ -255,6 +255,7 @@ dependencies = [
  "gyrfalcon-index",
  "gyrfalcon-parser",
  "notify",
+ "quick-xml",
  "rayon",
  "regex",
  "rusqlite",

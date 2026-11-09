@@ -17,6 +17,7 @@ pub mod http;
 pub mod install;
 pub mod kb_1c;
 pub mod mcp_http;
+pub mod metadata_tree;
 pub mod platform_help;
 pub mod practice_ast;
 pub mod practice_mining;

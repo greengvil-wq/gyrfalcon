@@ -117,6 +117,7 @@ fn маршрут(путь: &str, conn: &Connection) -> (&'static str, Vec<u8>) 
         ),
         "/map" => ("text/html; charset=utf-8", ui::PAGE.as_bytes().to_vec()),
         "/api/explore" => json(explore(conn, запрос)),
+        "/api/metadata" => json(metadata(conn, запрос)),
         "/api/summary" => json(ui::summary_data(conn)),
         "/api/movements" => json(ui::movements_data(conn, limit)),
         "/api/subsystems" => json(ui::subsystems_data(conn, limit)),
@@ -126,6 +127,20 @@ fn маршрут(путь: &str, conn: &Connection) -> (&'static str, Vec<u8>) 
             format!("нет такого адреса: {адрес}").into_bytes(),
         ),
     }
+}
+
+fn metadata(conn: &Connection, query: &str) -> Result<serde_json::Value, String> {
+    let mut values = std::collections::HashMap::new();
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        values.insert(key, decode_component(value)?);
+    }
+    crate::metadata_tree::data(
+        conn,
+        values.get("kind").map(String::as_str),
+        values.get("name").map(String::as_str),
+        values.get("module").map(String::as_str),
+    )
 }
 
 /// Только четыре операции чтения; SQL и изменения через браузер недоступны.
@@ -184,9 +199,7 @@ mod tests {
             .contains("доступны"));
         assert!(explore(&база(), "tool=delete_project").is_err());
         let (_, page) = маршрут("/", &база());
-        assert!(String::from_utf8(page)
-            .unwrap()
-            .contains("Найти и разобраться"));
+        assert!(String::from_utf8(page).unwrap().contains("metadataTree"));
     }
 
     fn база() -> Connection {
